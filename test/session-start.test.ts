@@ -24,6 +24,7 @@ function runHook(
     delete env.AGY_FAST_HOST;
     delete env.AGY_FAST_EDITS_FORMAT;
     delete env.AGY_FAST_CACHE_DIR;
+    delete env.NODE_USE_ENV_PROXY;
     for (const [k, v] of Object.entries(extraEnv)) {
       if (v === undefined) delete env[k];
       else env[k] = v;
@@ -583,6 +584,7 @@ describe("session-start hook", () => {
           if (v === undefined) delete env[k];
           else env[k] = v;
         }
+        delete env.NODE_USE_ENV_PROXY;
         const child = spawn(hookCmd, {
           cwd,
           env,
