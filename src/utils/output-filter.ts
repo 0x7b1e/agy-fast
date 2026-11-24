@@ -462,7 +462,7 @@ function stripBenignZeroCounts(line: string): string {
 }
 
 const ERROR_LINE_PATTERN =
-  /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
+  /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|^\s*(?:not ok\b|[✖✕✘✗×●]\s+\S)|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
 
 const ROOT_CAUSE_HEADER_PATTERN =
   /(?:^\s*(?:description|action):|caused by:|application failed to start|⎯\s*failed tests|compilation error)/i;
@@ -476,7 +476,8 @@ function isErrorLine(line: string): boolean {
 }
 
 function hasFoldDangerToken(line: string): boolean {
-  return FOLD_DANGER_TOKEN_PATTERN.test(stripBenignZeroCounts(line));
+  const cleaned = stripBenignZeroCounts(line);
+  return ERROR_LINE_PATTERN.test(cleaned) || FOLD_DANGER_TOKEN_PATTERN.test(cleaned);
 }
 
 const JSON_INFO_LOG_PATTERNS: RegExp[] = [
@@ -557,7 +558,7 @@ const UNAMBIGUOUS_TEST_PASS_PATTERNS: RegExp[] = [
 ];
 
 function isUnambiguousTestPassLine(trimmed: string): boolean {
-  if (!trimmed || /[✖✘✗×]/.test(trimmed)) return false;
+  if (!trimmed || /[✖✕✘✗×]/.test(trimmed)) return false;
   return UNAMBIGUOUS_TEST_PASS_PATTERNS.some((re) => re.test(trimmed));
 }
 
@@ -813,7 +814,7 @@ function compactLongFailureLines(lines: string[], maxChars: number): string {
       const from = Math.max(0, i - 1);
       const to = Math.min(lines.length - 1, i + 8);
       for (let j = from; j <= to; j++) keepIndices.add(j);
-    } else if (isErrorLine(line)) {
+    } else if (isErrorLine(line) || (monoInner.length > 0 && isErrorLine(monoInner))) {
       if (firstErrorLineIdx === -1) firstErrorLineIdx = i;
       const from = Math.max(0, i - 1);
       const to = Math.min(lines.length - 1, i + 3);
