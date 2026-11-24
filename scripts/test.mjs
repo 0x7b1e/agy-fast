@@ -38,7 +38,12 @@ for (const file of entries) {
 
 const testEnv = { ...process.env };
 delete testEnv.NODE_USE_ENV_PROXY;
-const res = spawnSync(process.execPath, ["--test", ...outFiles], {
+const testArgs = [
+  "--test",
+  ...(process.platform === "win32" ? ["--test-concurrency=1"] : []),
+  ...outFiles,
+];
+const res = spawnSync(process.execPath, testArgs, {
   cwd: rootDir,
   env: testEnv,
   stdio: "inherit",
