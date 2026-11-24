@@ -36,8 +36,11 @@ for (const file of entries) {
   outFiles.push(outFile);
 }
 
+const testEnv = { ...process.env };
+delete testEnv.NODE_USE_ENV_PROXY;
 const res = spawnSync(process.execPath, ["--test", ...outFiles], {
   cwd: rootDir,
+  env: testEnv,
   stdio: "inherit",
 });
 
