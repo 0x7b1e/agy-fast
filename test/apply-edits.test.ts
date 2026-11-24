@@ -1912,4 +1912,70 @@ describe("apply_edits", () => {
     assert.match(bulkRes.text, /Partial edit applied \(0\/49 file\(s\) written, 48 unchanged; 1 file\(s\) failed/);
     assert.match(bulkRes.text, /total 0 written, 48 unchanged\)/);
   });
+
+  it("rejects hunk edits on non-UTF-8 files without corrupting bytes while allowing explicit create+overwrite", async () => {
+    // CP1252 (0xe9 = 'é') + GBK (0xd6 0xd0 0xce 0xc4 = '中文') without NUL or UTF-16 BOM
+    const legacyBytes = Buffer.from([
+      0x2f, 0x2f, 0x20, 0x63, 0x61, 0x66, 0xe9, 0x0a,
+      0x2f, 0x2f, 0x20, 0xd6, 0xd0, 0xce, 0xc4, 0x0a,
+      ...Buffer.from("const x = 1;\n", "ascii"),
+    ]);
+    const legacyPath = path.join(tmpDir, "legacy-non-utf8.js");
+    const utf8SiblingPath = path.join(tmpDir, "utf8-sibling.js");
+    await fs.writeFile(legacyPath, legacyBytes);
+    await fs.writeFile(utf8SiblingPath, "const y = 1;\n", "utf8");
+
+    // 1. Atomic mode rejects non-UTF-8 hunk edit and leaves disk bytes untouched
+    const atomicRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "legacy-non-utf8.js",
+          hunks: [{ target: "const x = 1;", replacement: "const x = 2;" }],
+        },
+        {
+          path: "utf8-sibling.js",
+          hunks: [{ target: "const y = 1;", replacement: "const y = 2;" }],
+        },
+      ],
+    });
+    assert.equal(atomicRes.isError, true);
+    assert.match(atomicRes.text, /not valid UTF-8/i);
+    assert.deepEqual(await fs.readFile(legacyPath), legacyBytes);
+    assert.equal(await fs.readFile(utf8SiblingPath, "utf8"), "const y = 1;\n");
+
+    // 2. bestEffort mode commits valid UTF-8 sibling while leaving non-UTF-8 file untouched
+    const bestEffortRes = await runApplyEdits({
+      cwd: tmpDir,
+      bestEffort: true,
+      edits: [
+        {
+          path: "legacy-non-utf8.js",
+          hunks: [{ target: "const x = 1;", replacement: "const x = 2;" }],
+        },
+        {
+          path: "utf8-sibling.js",
+          hunks: [{ target: "const y = 1;", replacement: "const y = 2;" }],
+        },
+      ],
+    });
+    assert.equal(bestEffortRes.isError, true);
+    assert.match(bestEffortRes.text, /not valid UTF-8/i);
+    assert.deepEqual(await fs.readFile(legacyPath), legacyBytes);
+    assert.equal(await fs.readFile(utf8SiblingPath, "utf8"), "const y = 2;\n");
+
+    // 3. Explicit create + overwrite: true still allows intentionally rewriting a legacy file as UTF-8
+    const overwriteRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "legacy-non-utf8.js",
+          create: "// café\n// 中文\nconst x = 2;\n",
+          overwrite: true,
+        },
+      ],
+    });
+    assert.equal(overwriteRes.isError, false, overwriteRes.text);
+    assert.equal(await fs.readFile(legacyPath, "utf8"), "// café\n// 中文\nconst x = 2;\n");
+  });
 });
