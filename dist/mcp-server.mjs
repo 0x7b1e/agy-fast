@@ -1631,14 +1631,15 @@ function stripBenignZeroCounts(line) {
   );
   return afterLeading.replace(BENIGN_ZERO_COUNT_TRAILING_RE, " ");
 }
-var ERROR_LINE_PATTERN = /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
+var ERROR_LINE_PATTERN = /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|^\s*(?:not ok\b|[✖✕✘✗×●]\s+\S)|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
 var ROOT_CAUSE_HEADER_PATTERN = /(?:^\s*(?:description|action):|caused by:|application failed to start|⎯\s*failed tests|compilation error)/i;
 var FOLD_DANGER_TOKEN_PATTERN = /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|warns?|warnings?|exceptions?|tracebacks?|panics?|fatals?|assertions?|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined|compilation error|killed|sigkill|sigsegv|sigabrt|oom|out of memory|timed out|timeout|refused|denied|permission|unhandled|mismatched|mismatch)\b|\bexit\s+(?:status|code)\s+[1-9]\d*\b|caused by:|application failed to start|<<<\s*(?:failure|error)|[✖✘✗×]\s+|找不到符号|符号:|位置:|错误|失败|异常|警告)/i;
 function isErrorLine(line) {
   return ERROR_LINE_PATTERN.test(stripBenignZeroCounts(line));
 }
 function hasFoldDangerToken(line) {
-  return FOLD_DANGER_TOKEN_PATTERN.test(stripBenignZeroCounts(line));
+  const cleaned = stripBenignZeroCounts(line);
+  return ERROR_LINE_PATTERN.test(cleaned) || FOLD_DANGER_TOKEN_PATTERN.test(cleaned);
 }
 var JSON_INFO_LOG_PATTERNS = [
   /^\s*\{"level":(?:10|20|30)\b/,
@@ -1706,7 +1707,7 @@ var UNAMBIGUOUS_TEST_PASS_PATTERNS = [
   /^PASS\s+\S+\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|kt|cs|php|vue|svelte)\b/
 ];
 function isUnambiguousTestPassLine(trimmed) {
-  if (!trimmed || /[✖✘✗×]/.test(trimmed)) return false;
+  if (!trimmed || /[✖✕✘✗×]/.test(trimmed)) return false;
   return UNAMBIGUOUS_TEST_PASS_PATTERNS.some((re) => re.test(trimmed));
 }
 var MIN_FOLD_RUN_LINES = 4;
@@ -1900,7 +1901,7 @@ function compactLongFailureLines(lines, maxChars) {
       const from = Math.max(0, i - 1);
       const to = Math.min(lines.length - 1, i + 8);
       for (let j = from; j <= to; j++) keepIndices.add(j);
-    } else if (isErrorLine(line)) {
+    } else if (isErrorLine(line) || monoInner.length > 0 && isErrorLine(monoInner)) {
       if (firstErrorLineIdx === -1) firstErrorLineIdx = i;
       const from = Math.max(0, i - 1);
       const to = Math.min(lines.length - 1, i + 3);
