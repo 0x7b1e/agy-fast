@@ -529,6 +529,10 @@ export async function detectInstallKind(pluginDir: string): Promise<InstallKind>
     return "copied";
   }
 
+  const norm = resolved.split(path.sep).join("/").toLowerCase();
+  const isPluginInstallDir =
+    norm.endsWith("/plugins/agy-fast") || norm.includes("/plugins/agy-fast/");
+
   const hasGit = await pathExists(path.join(resolved, ".git"));
   if (hasGit) {
     const statusRes = await execBinaryAsync("git", ["status", "--porcelain"], {
@@ -541,16 +545,13 @@ export async function detectInstallKind(pluginDir: string): Promise<InstallKind>
     }
     // Only auto-update git clones inside a plugins/agy-fast directory unless forced manually;
     // a standalone source repo outside plugins/ is treated as a developer workspace.
-    const norm = resolved.split(path.sep).join("/").toLowerCase();
-    const isPluginInstallDir =
-      norm.endsWith("/plugins/agy-fast") || norm.includes("/plugins/agy-fast/");
     if (!isPluginInstallDir) {
       return "dev-source";
     }
     return "git-clone";
   }
 
-  if (await pathExists(path.join(resolved, "src"))) {
+  if (!isPluginInstallDir && (await pathExists(path.join(resolved, "src")))) {
     return "dev-source";
   }
   return "copied";

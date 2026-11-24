@@ -10,6 +10,7 @@ import {
   clearSkippedVersion,
   compareSemver,
   consumeSnapshotUpdateNotice,
+  detectInstallKind,
   extractGithubSlug,
   fetchLatestRemoteVersion,
   getHomeDir,
@@ -1091,5 +1092,19 @@ rl.on("line", (line) => {
     );
     assert.match(mainDoc, /update available: main \(abcdef1\)/);
     assert.match(mainDoc, /Release: https:\/\/github\.com\/INK-Q\/agy-fast\/commit\/abcdef1234567890/);
+  });
+
+  it("treats copied installs inside plugins/agy-fast with src/ as copied instead of dev-source", async () => {
+    const pluginWithSrc = path.join(rootTmp, "profile", "plugins", "agy-fast");
+    await copyRuntimeFixture(pluginWithSrc, "0.2.0", "plugin-with-src");
+    await fs.mkdir(path.join(pluginWithSrc, "src"), { recursive: true });
+    await fs.writeFile(path.join(pluginWithSrc, "src", "dummy.ts"), "export {};\n", "utf8");
+    assert.equal(await detectInstallKind(pluginWithSrc), "copied");
+
+    const outsideWithSrc = path.join(rootTmp, "workspace", "agy-fast");
+    await copyRuntimeFixture(outsideWithSrc, "0.2.0", "outside-with-src");
+    await fs.mkdir(path.join(outsideWithSrc, "src"), { recursive: true });
+    await fs.writeFile(path.join(outsideWithSrc, "src", "dummy.ts"), "export {};\n", "utf8");
+    assert.equal(await detectInstallKind(outsideWithSrc), "dev-source");
   });
 });

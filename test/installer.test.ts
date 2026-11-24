@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -683,6 +683,59 @@ describe("installer", () => {
       assert.equal(backToLazy.mcpServers.fast.tools, undefined);
     } finally {
       await fs.rm(modeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to atomic in-place sync on EBUSY/EPERM copied dir and fails clearly for --link", async () => {
+    const busyHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-ebusy-"));
+    const env = makeIsolatedEnv(busyHome);
+    const targetDir = path.join(busyHome, ".gemini", "config", "plugins", "agy-fast");
+    let locker: ReturnType<typeof spawn> | null = null;
+    try {
+      execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "install", "--no-enable", "--no-acp"],
+        { env, encoding: "utf8" },
+      );
+      await fs.writeFile(path.join(targetDir, "rules", "custom.local.md"), "keep-me\n", "utf8");
+
+      // Hold a cwd lock inside targetDir (on Windows this causes EBUSY on rmdir)
+      locker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        cwd: path.join(targetDir, "dist"),
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      await new Promise((r) => setTimeout(r, 150));
+
+      const reinstallOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "install", "--no-enable", "--no-acp"],
+        { env, encoding: "utf8" },
+      );
+      assert.match(reinstallOut, /Installed agy-fast/);
+      if (process.platform === "win32") {
+        assert.match(reinstallOut, /updated files atomically in-place/i);
+      }
+      assert.equal(
+        await fs.readFile(path.join(targetDir, "rules", "custom.local.md"), "utf8"),
+        "keep-me\n",
+      );
+
+      if (process.platform === "win32") {
+        assert.throws(
+          () =>
+            execFileSync(
+              process.execPath,
+              [INSTALL_SCRIPT, "install", "--link", "--no-enable", "--no-acp"],
+              { env, encoding: "utf8" },
+            ),
+          /Close the running host\/MCP process/i,
+        );
+      }
+    } finally {
+      if (locker) locker.kill("SIGKILL");
+      await new Promise((r) => setTimeout(r, 100));
+      await fs.rm(busyHome, { recursive: true, force: true }).catch(() => {});
     }
   });
 });

@@ -578,6 +578,8 @@ async function detectInstallKind(pluginDir) {
   } catch {
     return "copied";
   }
+  const norm = resolved.split(path2.sep).join("/").toLowerCase();
+  const isPluginInstallDir = norm.endsWith("/plugins/agy-fast") || norm.includes("/plugins/agy-fast/");
   const hasGit = await pathExists(path2.join(resolved, ".git"));
   if (hasGit) {
     const statusRes = await execBinaryAsync("git", ["status", "--porcelain"], {
@@ -588,14 +590,12 @@ async function detectInstallKind(pluginDir) {
     if (statusRes.error || statusRes.exitCode !== 0 || statusRes.stdout.trim() !== "") {
       return "git-dirty";
     }
-    const norm = resolved.split(path2.sep).join("/").toLowerCase();
-    const isPluginInstallDir = norm.endsWith("/plugins/agy-fast") || norm.includes("/plugins/agy-fast/");
     if (!isPluginInstallDir) {
       return "dev-source";
     }
     return "git-clone";
   }
-  if (await pathExists(path2.join(resolved, "src"))) {
+  if (!isPluginInstallDir && await pathExists(path2.join(resolved, "src"))) {
     return "dev-source";
   }
   return "copied";
