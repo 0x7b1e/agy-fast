@@ -825,6 +825,10 @@ function execBinaryAsync(bin, args, options) {
 var WINDOWS_PS_DOUBLE_QUOTABLE_VAR_RE = /(?<![\\`])(?:\$env:[A-Za-z_][A-Za-z0-9_]*|\$(?:LASTEXITCODE|PSVersionTable|PSScriptRoot|PROFILE)\b)/i;
 var WINDOWS_PS_UNQUOTED_SYNTAX_RE = /(?<![\\`])\$(?:HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/im;
 var WINDOWS_PS_CMDLET_RE = /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Z][A-Za-z0-9]*\b(?!-)/;
+var WINDOWS_CMD_ENV_VAR_RE = /%[A-Za-z_][A-Za-z0-9_()]*%/;
+var WINDOWS_CMD_UNQUOTED_SYNTAX_RE = /(?:^|[;&|(\r\n])\s*@?(?:set\s+(?:\/[ap]\s+|[A-Za-z_][A-Za-z0-9_]*=)|(?:setlocal|endlocal|rem|call|goto)\b|::|(?:cd|chdir)\s+\/d\b|if\s+(?:\/i\s+(?:not\s+)?|(?:not\s+)?(?:errorlevel\s+\d|exist\s|defined\s|cmdextversion\s+\d|[^(\r\n;&|]*==))|for\s+(?:\/[dflr]\b|%%?[A-Za-z]\s+in\b))|(?<![\\`])(?:>>?|<)\s*nul(?=$|[\s;&|)])/i;
+var WINDOWS_CMD_QUOTED_SET_AT_POS_RE = /^@?set[ \t]+(?:\/[ap][ \t]+)?"[A-Za-z_][A-Za-z0-9_]*=/i;
+var WINDOWS_PS51_CHAIN_OPERATOR_RE = /&&|\|\|/;
 var EXPLICIT_POWERSHELL_INVOCATION_RE = /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
 var PS_NON_INVOCATION_TAIL_RE = /^(?:[|;&+}=),*?]|(?:[1-6*])?>|-(?:c|i)?(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|replace|split|join|in|notin|contains|notcontains|is|isnot|as|and|or|xor|shl|shr|band|bor|bxor)\b|-f\b|$)/i;
 var PS_UTF8_PREFIX = "try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}; $OutputEncoding = [System.Text.UTF8Encoding]::new($false);";
@@ -958,6 +962,100 @@ function unwrapTrivialWindowsPowerShellCommand(command) {
   }
   return inner;
 }
+function hasPowerShellSemicolonChaining(command, withoutSingle, unquoted) {
+  if (WINDOWS_CMD_ENV_VAR_RE.test(withoutSingle) || WINDOWS_CMD_UNQUOTED_SYNTAX_RE.test(unquoted) || WINDOWS_PS51_CHAIN_OPERATOR_RE.test(unquoted)) {
+    return false;
+  }
+  let quote = null;
+  let sawLeadingToken = false;
+  let atStatementStart = true;
+  let hasSemicolonChain = false;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    const next = command[i + 1];
+    if (quote === "'") {
+      if (ch === "'") {
+        if (next === "'") {
+          i++;
+        } else {
+          quote = null;
+        }
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if ((ch === "\\" || ch === "`") && (next === ch || next === '"')) {
+        i++;
+        continue;
+      }
+      if (ch === '"') {
+        if (next === '"') {
+          i++;
+        } else {
+          quote = null;
+        }
+      }
+      continue;
+    }
+    if (ch === "'") {
+      quote = "'";
+      sawLeadingToken = true;
+      atStatementStart = false;
+      continue;
+    }
+    if (ch === '"') {
+      quote = '"';
+      sawLeadingToken = true;
+      atStatementStart = false;
+      continue;
+    }
+    if (ch === ";") {
+      const prev = i > 0 ? command[i - 1] : "";
+      const prevPrev = i > 1 ? command[i - 2] : "";
+      const isEscaped = prev === "^" || prev === "`" || prev === "\\" && (i === 1 || /\s/.test(prevPrev));
+      if (sawLeadingToken && !isEscaped && (next === " " || next === "	")) {
+        let j = i + 1;
+        while (j < command.length && (command[j] === " " || command[j] === "	")) {
+          j++;
+        }
+        if (j < command.length && command[j] !== "\r" && command[j] !== "\n" && command[j] !== ";") {
+          hasSemicolonChain = true;
+        }
+      }
+      atStatementStart = true;
+      continue;
+    }
+    if (ch === "&") {
+      const prev = i > 0 ? command[i - 1] : "";
+      if (prev !== ">" && !atStatementStart) {
+        return false;
+      }
+      if (atStatementStart) {
+        sawLeadingToken = true;
+        atStatementStart = false;
+      }
+      continue;
+    }
+    if (ch === "\r" || ch === "\n") {
+      sawLeadingToken = false;
+      atStatementStart = true;
+      continue;
+    }
+    if (ch === "|" || ch === "(" || ch === "{") {
+      atStatementStart = true;
+      continue;
+    }
+    if (ch === " " || ch === "	") {
+      continue;
+    }
+    if (atStatementStart && WINDOWS_CMD_QUOTED_SET_AT_POS_RE.test(command.slice(i))) {
+      return false;
+    }
+    sawLeadingToken = true;
+    atStatementStart = false;
+  }
+  return hasSemicolonChain;
+}
 function stripQuotedSpans(command, stripDoubleQuotes) {
   let out = "";
   let quote = null;
@@ -1017,7 +1115,7 @@ function needsPowerShellOnWindows(command) {
     return true;
   }
   const unquoted = stripQuotedSpans(command, true);
-  return WINDOWS_PS_UNQUOTED_SYNTAX_RE.test(unquoted) || WINDOWS_PS_CMDLET_RE.test(unquoted);
+  return WINDOWS_PS_UNQUOTED_SYNTAX_RE.test(unquoted) || WINDOWS_PS_CMDLET_RE.test(unquoted) || hasPowerShellSemicolonChaining(command, withoutSingle, unquoted);
 }
 function formatPowerShellCommand(command) {
   const trimmed = command.trim();
