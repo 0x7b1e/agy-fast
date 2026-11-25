@@ -742,8 +742,10 @@ describe("installer", () => {
         await fs.readFile(path.join(targetDir, "rules", "custom.local.md"), "utf8"),
         customRuleContent,
       );
-      const targetEntries = await fs.readdir(targetDir);
-      assert.equal(targetEntries.some((n) => n.includes(".agy-tmp.")), false);
+      for (const dir of [targetDir, path.join(targetDir, "dist"), path.join(targetDir, "rules")]) {
+        const entries = await fs.readdir(dir);
+        assert.equal(entries.some((n) => n.includes(".agy-tmp.")), false);
+      }
       const parentEntries = await fs.readdir(path.dirname(targetDir));
       assert.equal(parentEntries.some((n) => n.includes(".agy-trash-")), false);
 
@@ -765,7 +767,7 @@ describe("installer", () => {
         assert.equal(JSON.parse(await fs.readFile(targetManifestPath, "utf8")).name, "agy-fast");
       }
     } finally {
-      if (locker && locker.exitCode === null) {
+      if (locker && locker.exitCode === null && locker.signalCode === null) {
         const closed = new Promise<void>((resolve) => {
           locker!.once("close", () => resolve());
         });

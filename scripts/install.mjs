@@ -441,7 +441,7 @@ async function assertRemovableTarget(targetPath, stat) {
   }
 }
 
-async function removeTargetPath(targetPath, stat) {
+async function removeTargetPath(targetPath, stat, { quiet = false } = {}) {
   if (!stat) {
     return;
   }
@@ -451,9 +451,21 @@ async function removeTargetPath(targetPath, stat) {
   }
   if (stat.isDirectory()) {
     // Evacuate via atomic same-parent rename first so an EBUSY/EPERM lock fails before deleting any file.
-    const trashPath = `${targetPath}.agy-trash-${process.pid}-${Date.now()}`;
+    const trashPath = path.join(
+      path.dirname(targetPath),
+      `.${path.basename(targetPath)}.agy-trash-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    );
     await fs.rename(targetPath, trashPath);
-    await fs.rm(trashPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    try {
+      await fs.rm(trashPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } catch (rmErr) {
+      // Target path is already vacated atomically; warn instead of misclassifying post-rename cleanup errors as a target lock.
+      if (!quiet) {
+        console.warn(
+          `Warning: removed ${targetPath}, but failed to clean up temporary staging directory ${trashPath}: ${rmErr instanceof Error ? rmErr.message : String(rmErr)}`,
+        );
+      }
+    }
     return;
   }
   await fs.rm(targetPath, { force: true });
@@ -954,7 +966,7 @@ async function syncIsolatedPluginDir(resolvedSrc, primaryGlobalDir, isolated, op
   let mode = "symlink";
   let migratedToPrimary = { restored: [], keptExisting: [] };
   try {
-    await removeTargetPath(isolated.pluginDir, isoStat);
+    await removeTargetPath(isolated.pluginDir, isoStat, { quiet: opts.quiet });
   } catch (err) {
     if (!opts.useLink && isoStat?.isDirectory() && !isoStat.isSymbolicLink() && isLockedTargetError(err)) {
       try {
@@ -1299,7 +1311,7 @@ async function runInstall(opts) {
     const { preserved: replacedLocalRules } = await snapshotLocalRuleFiles(resolvedDst);
     await fs.mkdir(path.dirname(resolvedDst), { recursive: true });
     try {
-      await removeTargetPath(resolvedDst, dstStat);
+      await removeTargetPath(resolvedDst, dstStat, { quiet: opts.quiet });
     } catch (err) {
       if (isLockedTargetError(err)) {
         throw formatLockedTargetError(resolvedDst, err);
@@ -1324,7 +1336,7 @@ async function runInstall(opts) {
     let inPlaceSynced = false;
     if (dstStat) {
       try {
-        await removeTargetPath(resolvedDst, dstStat);
+        await removeTargetPath(resolvedDst, dstStat, { quiet: opts.quiet });
       } catch (err) {
         if (dstStat.isDirectory() && !dstStat.isSymbolicLink() && isLockedTargetError(err)) {
           try {
@@ -1775,14 +1787,28 @@ async function runUninstall(opts) {
   }
 
   for (const { isolated, stat } of existingIsolated) {
-    await removeTargetPath(isolated.pluginDir, stat);
+    try {
+      await removeTargetPath(isolated.pluginDir, stat, { quiet: opts.quiet });
+    } catch (err) {
+      if (isLockedTargetError(err)) {
+        throw formatLockedTargetError(isolated.pluginDir, err);
+      }
+      throw err;
+    }
     if (!opts.quiet) {
       console.log(`Removed agy-fast from ${isolated.pluginDir} (${isolated.label})`);
     }
   }
 
   if (dstStat) {
-    await removeTargetPath(resolvedDst, dstStat);
+    try {
+      await removeTargetPath(resolvedDst, dstStat, { quiet: opts.quiet });
+    } catch (err) {
+      if (isLockedTargetError(err)) {
+        throw formatLockedTargetError(resolvedDst, err);
+      }
+      throw err;
+    }
     if (!opts.quiet) {
       console.log(`Removed agy-fast from ${resolvedDst}`);
     }

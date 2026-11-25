@@ -909,6 +909,90 @@ describe("session-start hook", () => {
       assert.ok(root !== null, "Expected non-null repo-root snapshot");
       assert.match(root, /Git: branch `[^`]+`\n/);
       assert.match(root, /M packages\/app\/src\/a\.ts, M packages\/other\/b\.ts/);
+
+      // rev-parse timeout must not misclassify a clean tracked nested workspace as untracked
+      const nestedRevParseTimeout = await buildWorkspaceSnapshot(appDir, {
+        gitExec: async (_bin, args) => {
+          if (args.includes("rev-parse")) {
+            return {
+              exitCode: null,
+              signal: "SIGTERM",
+              timedOut: true,
+              durationMs: 800,
+              stdout: "",
+              stderr: "",
+              truncated: false,
+            };
+          }
+          if (args.includes("status")) {
+            return {
+              exitCode: 0,
+              signal: null,
+              timedOut: false,
+              durationMs: 5,
+              stdout: "## main\n",
+              stderr: "",
+              truncated: false,
+            };
+          }
+          return {
+            exitCode: 0,
+            signal: null,
+            timedOut: false,
+            durationMs: 5,
+            stdout: "abc1234 feat: outer repo\n",
+            stderr: "",
+            truncated: false,
+          };
+        },
+      });
+      assert.ok(nestedRevParseTimeout !== null);
+      assert.match(nestedRevParseTimeout, /Git: branch `main` \(repo root: \.\.\/\.\.\)\n/);
+      assert.match(nestedRevParseTimeout, /Working tree: clean/);
+
+      // When both status and rev-parse time out on a nested workspace, keep the timeout fallback
+      const nestedAllTimeout = await buildWorkspaceSnapshot(appDir, {
+        gitExec: async () => ({
+          exitCode: null,
+          signal: "SIGTERM",
+          timedOut: true,
+          durationMs: 800,
+          stdout: "",
+          stderr: "",
+          truncated: false,
+        }),
+      });
+      assert.ok(nestedAllTimeout !== null);
+      assert.match(nestedAllTimeout, /Git: branch `[^`]+` \(repo root: \.\.\/\.\.\)\n/);
+      assert.match(nestedAllTimeout, /Working tree: unknown \(git status timed out\)/);
+
+      // Even if rev-parse times out, an untracked nested dir reported as `?? scratch/demo/` is still omitted
+      const untrackedRevParseTimeout = await buildWorkspaceSnapshot(untrackedDir, {
+        gitExec: async (_bin, args) => {
+          if (args.includes("rev-parse")) {
+            return {
+              exitCode: null,
+              signal: "SIGTERM",
+              timedOut: true,
+              durationMs: 800,
+              stdout: "",
+              stderr: "",
+              truncated: false,
+            };
+          }
+          return {
+            exitCode: 0,
+            signal: null,
+            timedOut: false,
+            durationMs: 5,
+            stdout: args.includes("status") ? "## main\n?? scratch/demo/\n" : "abc1234 feat: outer repo\n",
+            stderr: "",
+            truncated: false,
+          };
+        },
+      });
+      assert.ok(untrackedRevParseTimeout !== null);
+      assert.doesNotMatch(bodyOf(untrackedRevParseTimeout), /Git: branch|feat: outer repo/);
     } finally {
       await fs.rm(outerDir, { recursive: true, force: true });
     }
@@ -924,6 +1008,19 @@ describe("session-start hook", () => {
     assert.equal(
       toWorkspaceRelativeStatusLine("R  packages/app/old.ts -> packages/app/src/new.ts", 2),
       "R  old.ts -> src/new.ts",
+    );
+    assert.equal(
+      toWorkspaceRelativeStatusLine("C  packages/app/src.ts -> packages/app/copy.ts", 2),
+      "C  src.ts -> copy.ts",
+    );
+    // Non-rename paths literally containing " -> " must not be split or dropped
+    assert.equal(
+      toWorkspaceRelativeStatusLine(' M "packages/app/a -> b/c/d.ts"', 2),
+      ' M "a -> b/c/d.ts"',
+    );
+    assert.equal(
+      toWorkspaceRelativeStatusLine('?? "packages/app/foo -> bar/"', 2),
+      '?? "foo -> bar/"',
     );
     // The workspace itself (or an ancestor) reported as one untracked directory
     assert.equal(toWorkspaceRelativeStatusLine("?? packages/app/", 2), null);
