@@ -384,25 +384,11 @@ describe("benchmark analyzer & CLI", () => {
     // Symlinked transcript files & session dirs are collected, deduplicated, and cycle-safe
     const symlinkDir = path.join(tmpDir, "symlink-runs");
     await fs.mkdir(symlinkDir, { recursive: true });
-    let hasSymlinks = false;
     try {
       await fs.symlink(
         path.join(sess1Logs, "transcript_full.jsonl"),
         path.join(symlinkDir, "s1-link.jsonl"),
       );
-      const dirLinkType = process.platform === "win32" ? "junction" : "dir";
-      await fs.symlink(
-        path.join(brainDir, "sess-1"),
-        path.join(symlinkDir, "s1-dir-link"),
-        dirLinkType,
-      );
-      await fs.symlink(
-        path.join(brainDir, "sess-2"),
-        path.join(symlinkDir, "s2-dir-link"),
-        dirLinkType,
-      );
-      await fs.symlink(symlinkDir, path.join(symlinkDir, "self-loop"), dirLinkType);
-      hasSymlinks = true;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (process.platform !== "win32" || (code !== "EPERM" && code !== "ENOTSUP")) {
@@ -410,13 +396,24 @@ describe("benchmark analyzer & CLI", () => {
       }
     }
 
-    if (hasSymlinks) {
-      const symlinkFiles = await collectTranscriptFiles([symlinkDir]);
-      assert.equal(symlinkFiles.length, 2);
-      const symlinkMetrics = await analyzePaths([symlinkDir]);
-      assert.equal(symlinkMetrics.sessions, 2);
-      assert.equal(symlinkMetrics.totalOutputTokens, 800);
-    }
+    const dirLinkType = process.platform === "win32" ? "junction" : "dir";
+    await fs.symlink(
+      path.join(brainDir, "sess-1"),
+      path.join(symlinkDir, "s1-dir-link"),
+      dirLinkType,
+    );
+    await fs.symlink(
+      path.join(brainDir, "sess-2"),
+      path.join(symlinkDir, "s2-dir-link"),
+      dirLinkType,
+    );
+    await fs.symlink(symlinkDir, path.join(symlinkDir, "self-loop"), dirLinkType);
+
+    const symlinkFiles = await collectTranscriptFiles([symlinkDir]);
+    assert.equal(symlinkFiles.length, 2);
+    const symlinkMetrics = await analyzePaths([symlinkDir]);
+    assert.equal(symlinkMetrics.sessions, 2);
+    assert.equal(symlinkMetrics.totalOutputTokens, 800);
   });
 
   it("unwraps double-JSON-encoded args, supports call.arguments, and matches git -C and env-prefixed readonly commands", () => {
