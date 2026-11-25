@@ -826,7 +826,7 @@ var WINDOWS_PS_DOUBLE_QUOTABLE_VAR_RE = /(?<![\\`])(?:\$env:[A-Za-z_][A-Za-z0-9_
 var WINDOWS_PS_UNQUOTED_SYNTAX_RE = /(?<![\\`])\$(?:HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/im;
 var WINDOWS_PS_CMDLET_RE = /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Z][A-Za-z0-9]*\b(?!-)/;
 var WINDOWS_CMD_ENV_VAR_RE = /%[A-Za-z_][A-Za-z0-9_()]*%/;
-var WINDOWS_CMD_UNQUOTED_SYNTAX_RE = /(?:^|[;&|(\r\n])\s*@?(?:set\s+(?:\/[ap]\s+|[A-Za-z_][A-Za-z0-9_]*=)|(?:setlocal|endlocal|rem|call|goto)\b|::|(?:cd|chdir)\s+\/d\b|if\s+(?:\/i\s+(?:not\s+)?|(?:not\s+)?(?:errorlevel\s+\d|exist\s|defined\s|cmdextversion\s+\d|[^(\r\n;&|]*==))|for\s+(?:\/[dflr]\b|%%?[A-Za-z]\s+in\b))|(?<![\\`])(?:>>?|<)\s*nul(?=$|[\s;&|)])/i;
+var WINDOWS_CMD_UNQUOTED_SYNTAX_RE = /(?:^|[;&|(\r\n])\s*@?(?:set\s+(?:\/[ap]\s+|[A-Za-z_][A-Za-z0-9_]*=)|(?:setlocal|endlocal|rem|call|goto)\b(?!-)|::|(?:cd|chdir)\s+\/d\b|if\s+(?:\/i\s+(?:not\s+)?|(?:not\s+)?(?:errorlevel\s+\d|exist\s|defined\s|cmdextversion\s+\d|[^(\r\n;&|]*==))|for\s+(?:\/[dflr]\b|%%?[A-Za-z]\s+in\b))|(?<![\\`])(?:>>?|<)\s*nul(?=$|[\s;&|)])/i;
 var WINDOWS_CMD_QUOTED_SET_AT_POS_RE = /^@?set[ \t]+(?:\/[ap][ \t]+)?"[A-Za-z_][A-Za-z0-9_]*=/i;
 var WINDOWS_PS51_CHAIN_OPERATOR_RE = /&&|\|\|/;
 var EXPLICIT_POWERSHELL_INVOCATION_RE = /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;

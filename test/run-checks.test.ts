@@ -344,6 +344,9 @@ describe("run_checks", () => {
       'echo "if errorlevel 1"; echo baz',
       'echo "2>nul"; echo baz',
       "npm run build && echo $LASTEXITCODE; echo done",
+      "call-api --check; echo done",
+      "rem-tool --version; rem-tool --help",
+      "goto-def --check; echo done",
     ];
     for (const cmd of mustRouteToPowerShell) {
       assert.equal(
