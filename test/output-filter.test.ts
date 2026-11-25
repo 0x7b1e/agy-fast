@@ -691,19 +691,47 @@ describe("output-filter", () => {
       for (const re of c.expect) assert.match(out, re);
     }
 
-    const jestOut = compact([
-      "viewport 1920 × 1080",
-      "status was not ok yet (not okay)",
-      "• Packages in scope: 4",
-      ...filler(20),
-      "  ● Cart › applies tax rate",
-      "    Expected: 10",
-      "    Received: 9",
-      ...filler(40),
-      "Test Suites: 1 failed, 1 total",
-    ]);
-    assert.match(jestOut, /● Cart › applies tax rate/);
-    assert.doesNotMatch(jestOut, /viewport 1920 × 1080/);
-    assert.doesNotMatch(jestOut, /status was not ok yet/);
+    const hijackOut = formatCompactCommandOutputWithMeta({
+      stdout: [
+        "PASS src/a.test.ts",
+        "  ● Console",
+        "●  (SSG)      prerendered as static HTML",
+        "● (Static)   prerendered as static content",
+        "● (Dynamic)  server-rendered on demand",
+        "● (ISR)      incremental static regeneration",
+        "status check: not ok yet (retrying)",
+        "viewport dims: × 1080",
+        "viewport 1920 × 1080",
+        "status was not ok yet (not okay)",
+        "• Packages in scope: 4",
+        ...filler(20),
+        "  ● Cart › applies tax rate",
+        "    Expected: 10",
+        "    Received: 9",
+        ...filler(40),
+        "Test Suites: 1 failed, 1 total",
+      ].join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 650,
+    }).text;
+    assert.match(hijackOut, /● Cart › applies tax rate/);
+    for (const noise of [/● Console/, /\(SSG\)/, /status check: not ok/, /viewport dims: × 1080/, /1920 × 1080/]) {
+      assert.doesNotMatch(hijackOut, noise);
+    }
+
+    const crossFoldMeta = formatCompactCommandOutputWithMeta({
+      stdout: [
+        ...Array.from({ length: 5 }, (_, i) => `PASS src/a${i}.test.ts ✕ note`),
+        ...filler(16),
+      ].join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 2000,
+    });
+    assert.equal(crossFoldMeta.collapsedLines, 0);
+    assert.match(crossFoldMeta.text, /PASS src\/a0\.test\.ts ✕ note/);
   });
 });
