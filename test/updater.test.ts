@@ -1101,10 +1101,21 @@ rl.on("line", (line) => {
     await fs.writeFile(path.join(pluginWithSrc, "src", "dummy.ts"), "export {};\n", "utf8");
     assert.equal(await detectInstallKind(pluginWithSrc), "copied");
 
+    const mixedCaseWithSrc = path.join(rootTmp, "profile-case", "Plugins", "AGY-FAST");
+    await copyRuntimeFixture(mixedCaseWithSrc, "0.2.0", "mixed-case-with-src");
+    await fs.mkdir(path.join(mixedCaseWithSrc, "src"), { recursive: true });
+    await fs.writeFile(path.join(mixedCaseWithSrc, "src", "dummy.ts"), "export {};\n", "utf8");
+    assert.equal(await detectInstallKind(mixedCaseWithSrc), "copied");
+
     const outsideWithSrc = path.join(rootTmp, "workspace", "agy-fast");
     await copyRuntimeFixture(outsideWithSrc, "0.2.0", "outside-with-src");
     await fs.mkdir(path.join(outsideWithSrc, "src"), { recursive: true });
     await fs.writeFile(path.join(outsideWithSrc, "src", "dummy.ts"), "export {};\n", "utf8");
     assert.equal(await detectInstallKind(outsideWithSrc), "dev-source");
+
+    const linkedPluginDir = path.join(rootTmp, "profile-link", "plugins", "agy-fast");
+    await fs.mkdir(path.dirname(linkedPluginDir), { recursive: true });
+    await fs.symlink(outsideWithSrc, linkedPluginDir, process.platform === "win32" ? "junction" : "dir");
+    assert.equal(await detectInstallKind(linkedPluginDir), "symlink");
   });
 });

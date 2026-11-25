@@ -697,15 +697,35 @@ describe("installer", () => {
         [INSTALL_SCRIPT, "install", "--no-enable", "--no-acp"],
         { env, encoding: "utf8" },
       );
-      await fs.writeFile(path.join(targetDir, "rules", "custom.local.md"), "keep-me\n", "utf8");
+      const customRuleContent = "---\ntrigger: always_on\n---\nkeep-me\n";
+      await fs.writeFile(path.join(targetDir, "rules", "custom.local.md"), customRuleContent, "utf8");
+      const targetManifestPath = path.join(targetDir, "plugin.json");
+      const beforeManifest = JSON.parse(await fs.readFile(targetManifestPath, "utf8"));
+      await fs.writeFile(
+        targetManifestPath,
+        JSON.stringify({ ...beforeManifest, version: "0.0.1-old" }, null, 2),
+        "utf8",
+      );
 
-      // Hold a cwd lock inside targetDir (on Windows this causes EBUSY on rmdir)
-      locker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      // Hold a cwd lock inside targetDir (on Windows this causes EBUSY on rename/rmdir)
+      locker = spawn(process.execPath, ["-e", 'console.log("READY"); setInterval(() => {}, 1000);'], {
         cwd: path.join(targetDir, "dist"),
-        stdio: "ignore",
+        stdio: ["ignore", "pipe", "ignore"],
         windowsHide: true,
       });
-      await new Promise((r) => setTimeout(r, 150));
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("locker did not emit READY")), 5000);
+        locker!.stdout!.on("data", (chunk: Buffer) => {
+          if (chunk.toString("utf8").includes("READY")) {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+        locker!.once("error", (e) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+      });
 
       const reinstallOut = execFileSync(
         process.execPath,
@@ -716,10 +736,16 @@ describe("installer", () => {
       if (process.platform === "win32") {
         assert.match(reinstallOut, /updated files atomically in-place/i);
       }
+      const afterManifest = JSON.parse(await fs.readFile(targetManifestPath, "utf8"));
+      assert.equal(afterManifest.version, beforeManifest.version);
       assert.equal(
         await fs.readFile(path.join(targetDir, "rules", "custom.local.md"), "utf8"),
-        "keep-me\n",
+        customRuleContent,
       );
+      const targetEntries = await fs.readdir(targetDir);
+      assert.equal(targetEntries.some((n) => n.includes(".agy-tmp.")), false);
+      const parentEntries = await fs.readdir(path.dirname(targetDir));
+      assert.equal(parentEntries.some((n) => n.includes(".agy-trash-")), false);
 
       if (process.platform === "win32") {
         assert.throws(
@@ -731,10 +757,21 @@ describe("installer", () => {
             ),
           /Close the running host\/MCP process/i,
         );
+        // Atomic rename failed before deleting plugin.json / custom.local.md, so both remain intact
+        assert.equal(
+          await fs.readFile(path.join(targetDir, "rules", "custom.local.md"), "utf8"),
+          customRuleContent,
+        );
+        assert.equal(JSON.parse(await fs.readFile(targetManifestPath, "utf8")).name, "agy-fast");
       }
     } finally {
-      if (locker) locker.kill("SIGKILL");
-      await new Promise((r) => setTimeout(r, 100));
+      if (locker && locker.exitCode === null) {
+        const closed = new Promise<void>((resolve) => {
+          locker!.once("close", () => resolve());
+        });
+        locker.kill("SIGKILL");
+        await closed;
+      }
       await fs.rm(busyHome, { recursive: true, force: true }).catch(() => {});
     }
   });

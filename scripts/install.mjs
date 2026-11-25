@@ -449,7 +449,14 @@ async function removeTargetPath(targetPath, stat) {
     await fs.unlink(targetPath);
     return;
   }
-  await fs.rm(targetPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  if (stat.isDirectory()) {
+    // Evacuate via atomic same-parent rename first so an EBUSY/EPERM lock fails before deleting any file.
+    const trashPath = `${targetPath}.agy-trash-${process.pid}-${Date.now()}`;
+    await fs.rename(targetPath, trashPath);
+    await fs.rm(trashPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    return;
+  }
+  await fs.rm(targetPath, { force: true });
 }
 
 async function verifyMcpServerLive(mcpScriptPath) {
@@ -944,53 +951,59 @@ async function syncIsolatedPluginDir(resolvedSrc, primaryGlobalDir, isolated, op
   const { preserved: preservedIsoLocalRules, skipped: skippedIsoLocalRules } =
     await snapshotLocalRuleFiles(isolated.pluginDir);
   await fs.mkdir(path.dirname(isolated.pluginDir), { recursive: true });
+  let mode = "symlink";
+  let migratedToPrimary = { restored: [], keptExisting: [] };
   try {
     await removeTargetPath(isolated.pluginDir, isoStat);
   } catch (err) {
     if (!opts.useLink && isoStat?.isDirectory() && !isoStat.isSymbolicLink() && isLockedTargetError(err)) {
-      await syncRuntimeFilesAtomically(resolvedSrc, isolated.pluginDir);
-      await applyToolLoadingToCopiedPluginDir(isolated.pluginDir, opts.effectiveToolLoading || "eager");
-      await restoreLocalRuleFiles(isolated.pluginDir, preservedIsoLocalRules);
-      if (!opts.quiet) {
-        console.log(
-          `Note: ${isolated.pluginDir} was locked by a running process; updated files atomically in-place. Reload your host window to load the new MCP server.`,
-        );
+      try {
+        await syncRuntimeFilesAtomically(resolvedSrc, isolated.pluginDir);
+      } catch (syncErr) {
+        if (isLockedTargetError(syncErr)) {
+          throw formatLockedTargetError(isolated.pluginDir, syncErr);
+        }
+        throw syncErr;
       }
-      return { synced: true, mode: "copied-in-place" };
-    }
-    if (isLockedTargetError(err)) {
+      if (opts.effectiveToolLoading) {
+        await applyToolLoadingToCopiedPluginDir(isolated.pluginDir, opts.effectiveToolLoading);
+      }
+      await restoreLocalRuleFiles(isolated.pluginDir, preservedIsoLocalRules);
+      mode = "copied-in-place";
+    } else if (isLockedTargetError(err)) {
       throw formatLockedTargetError(isolated.pluginDir, err);
+    } else {
+      throw err;
     }
-    throw err;
   }
 
   // Link directly to resolvedSrc in --link dev mode (avoids chained NTFS junctions on Windows),
   // otherwise link to primaryRealPath so auto-updates to ~/.gemini/config/plugins/agy-fast
   // propagate immediately to every isolated ACP profile.
   const linkSource = opts.useLink ? resolvedSrc : primaryRealPath;
-  const linkType = process.platform === "win32" ? "junction" : "dir";
-  let mode = "symlink";
-  let migratedToPrimary = { restored: [], keptExisting: [] };
-  try {
-    await fs.symlink(linkSource, isolated.pluginDir, linkType);
-  } catch (err) {
-    const code = err?.code;
-    if (code === "EPERM" || code === "ENOTSUP" || code === "EXDEV") {
-      await copyRuntimeFiles(resolvedSrc, isolated.pluginDir);
-      if (opts.effectiveToolLoading) {
-        await applyToolLoadingToCopiedPluginDir(isolated.pluginDir, opts.effectiveToolLoading);
+  if (mode !== "copied-in-place") {
+    const linkType = process.platform === "win32" ? "junction" : "dir";
+    try {
+      await fs.symlink(linkSource, isolated.pluginDir, linkType);
+    } catch (err) {
+      const code = err?.code;
+      if (code === "EPERM" || code === "ENOTSUP" || code === "EXDEV") {
+        await copyRuntimeFiles(resolvedSrc, isolated.pluginDir);
+        if (opts.effectiveToolLoading) {
+          await applyToolLoadingToCopiedPluginDir(isolated.pluginDir, opts.effectiveToolLoading);
+        }
+        await restoreLocalRuleFiles(isolated.pluginDir, preservedIsoLocalRules);
+        mode = "copied";
+      } else {
+        throw err;
       }
-      await restoreLocalRuleFiles(isolated.pluginDir, preservedIsoLocalRules);
-      mode = "copied";
-    } else {
-      throw err;
     }
-  }
-  if (mode === "symlink" && !opts.useLink && preservedIsoLocalRules.length > 0) {
-    migratedToPrimary = await restoreLocalRuleFiles(
-      primaryRealPath,
-      preservedIsoLocalRules,
-    );
+    if (mode === "symlink" && !opts.useLink && preservedIsoLocalRules.length > 0) {
+      migratedToPrimary = await restoreLocalRuleFiles(
+        primaryRealPath,
+        preservedIsoLocalRules,
+      );
+    }
   }
 
   if (!opts.quiet) {
@@ -1011,6 +1024,10 @@ async function syncIsolatedPluginDir(resolvedSrc, primaryGlobalDir, isolated, op
           `Note: --link replaced ${isolated.pluginDir}; local rule file(s) were not copied into dev checkout: ${preservedIsoLocalRules.map((f) => `rules/${f.name}`).join(", ")}`,
         );
       }
+    } else if (mode === "copied-in-place") {
+      console.log(
+        `Note: ${isolated.pluginDir} was locked by a running process; updated files atomically in-place. Reload your host window to load the new MCP server.`,
+      );
     } else {
       console.log(`Synced ${isolated.label} (copied): ${isolated.pluginDir}`);
     }
@@ -1305,18 +1322,29 @@ async function runInstall(opts) {
     const { preserved: preservedLocalRules, skipped: skippedLocalRules } =
       await snapshotLocalRuleFiles(resolvedDst);
     let inPlaceSynced = false;
-    try {
-      await removeTargetPath(resolvedDst, dstStat);
-      await copyRuntimeFiles(resolvedSrc, resolvedDst);
-    } catch (err) {
-      if (dstStat?.isDirectory() && !dstStat.isSymbolicLink() && isLockedTargetError(err)) {
-        await syncRuntimeFilesAtomically(resolvedSrc, resolvedDst);
-        inPlaceSynced = true;
-      } else if (isLockedTargetError(err)) {
-        throw formatLockedTargetError(resolvedDst, err);
-      } else {
-        throw err;
+    if (dstStat) {
+      try {
+        await removeTargetPath(resolvedDst, dstStat);
+      } catch (err) {
+        if (dstStat.isDirectory() && !dstStat.isSymbolicLink() && isLockedTargetError(err)) {
+          try {
+            await syncRuntimeFilesAtomically(resolvedSrc, resolvedDst);
+          } catch (syncErr) {
+            if (isLockedTargetError(syncErr)) {
+              throw formatLockedTargetError(resolvedDst, syncErr);
+            }
+            throw syncErr;
+          }
+          inPlaceSynced = true;
+        } else if (isLockedTargetError(err)) {
+          throw formatLockedTargetError(resolvedDst, err);
+        } else {
+          throw err;
+        }
       }
+    }
+    if (!inPlaceSynced) {
+      await copyRuntimeFiles(resolvedSrc, resolvedDst);
     }
     await applyToolLoadingToCopiedPluginDir(resolvedDst, effectiveToolLoading);
     const { restored } = await restoreLocalRuleFiles(resolvedDst, preservedLocalRules);
