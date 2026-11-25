@@ -763,17 +763,54 @@ function parsePorcelainBranchHeader(headerLine) {
   const branchOnly = body.split("...")[0]?.trim() || "HEAD";
   return { branch: branchOnly, isUnborn: false };
 }
+async function getRepoNestingDepth(workspaceDir, gitEntry) {
+  if (path3.dirname(gitEntry) === path3.resolve(workspaceDir)) return 0;
+  const realWorkspace = await fs.realpath(workspaceDir).catch(() => path3.resolve(workspaceDir));
+  const realEntry = await findGitEntry(realWorkspace);
+  if (!realEntry) return 0;
+  const rel = path3.relative(path3.dirname(realEntry), realWorkspace);
+  if (!rel || rel.startsWith("..") || path3.isAbsolute(rel)) return 0;
+  return rel.split(path3.sep).filter(Boolean).length;
+}
+function toWorkspaceRelativeStatusLine(line, nestingDepth) {
+  if (nestingDepth <= 0 || line.length < 4) return line;
+  let containsWorkspace = false;
+  const strip = (p) => {
+    const quoted = p.startsWith('"');
+    const segs = (quoted ? p.slice(1) : p).split("/");
+    const last = segs[segs.length - 1] ?? "";
+    const isDirEntry = last === "" || last === '"';
+    const nameCount = isDirEntry ? segs.length - 1 : segs.length;
+    if (nameCount <= nestingDepth) {
+      containsWorkspace = isDirEntry;
+      return p;
+    }
+    return `${quoted ? '"' : ""}${segs.slice(nestingDepth).join("/")}`;
+  };
+  const code = line.slice(0, 2);
+  const rest = line.slice(3).split(" -> ").map(strip).join(" -> ");
+  if (containsWorkspace && (code === "??" || code === "!!")) return null;
+  return `${line.slice(0, 3)}${rest}`;
+}
 async function getGitSummary(workspaceDir, timeoutMs, gitExec = execBinaryAsync) {
   const hasExplicitGitEnv = Boolean(process.env.GIT_DIR || process.env.GIT_WORK_TREE);
   const gitEntry = hasExplicitGitEnv ? null : await findGitEntry(workspaceDir);
   if (!hasExplicitGitEnv && !gitEntry) {
     return null;
   }
+  const nestingDepth = gitEntry ? await getRepoNestingDepth(workspaceDir, gitEntry) : 0;
+  const isNested = nestingDepth > 0;
   const gitEnv = withNonInteractiveGitEnv();
-  const [statusRes, logRes] = await Promise.all([
+  const [statusRes, logRes, headTreeRes] = await Promise.all([
     gitExec(
       "git",
-      [...HARDENED_GIT_BASE_ARGS, "status", "--porcelain=v1", "--branch"],
+      [
+        ...HARDENED_GIT_BASE_ARGS,
+        "status",
+        "--porcelain=v1",
+        "--branch",
+        ...isNested ? ["--", "."] : []
+      ],
       {
         cwd: workspaceDir,
         timeoutMs,
@@ -786,19 +823,31 @@ async function getGitSummary(workspaceDir, timeoutMs, gitExec = execBinaryAsync)
       timeoutMs,
       maxOutputBytes: 8192,
       env: gitEnv
-    })
+    }),
+    // Nested only: does HEAD contain the workspace directory at all? (single tree lookup)
+    isNested ? gitExec(
+      "git",
+      [...HARDENED_GIT_BASE_ARGS, "rev-parse", "--verify", "--quiet", "HEAD:./"],
+      { cwd: workspaceDir, timeoutMs, maxOutputBytes: 256, env: gitEnv }
+    ) : null
   ]);
   const statusOk = !statusRes.error && !statusRes.timedOut && statusRes.exitCode === 0;
   const logOk = !logRes.error && !logRes.timedOut && logRes.exitCode === 0;
+  const inHead = Boolean(
+    headTreeRes && !headTreeRes.error && !headTreeRes.timedOut && headTreeRes.exitCode === 0
+  );
   const fallbackBranch = !statusOk && gitEntry ? await readBranchFromGitEntry(gitEntry) : null;
   if (!statusOk && !logOk && !(statusRes.timedOut && fallbackBranch)) {
+    return null;
+  }
+  if (isNested && !statusOk && !inHead) {
     return null;
   }
   let branch = "HEAD";
   let isUnborn = false;
   let statusLines = [];
   if (statusOk) {
-    const rawLines = statusRes.stdout.split(/\r?\n/);
+    let rawLines = statusRes.stdout.split(/\r?\n/);
     if (statusRes.truncated && rawLines.length > 1) {
       rawLines.pop();
     }
@@ -810,6 +859,14 @@ async function getGitSummary(workspaceDir, timeoutMs, gitExec = execBinaryAsync)
       rawLines.splice(headerIdx, 1);
     } else {
       branch = await readBranchFromGitEntry(gitEntry) ?? "HEAD";
+    }
+    if (isNested) {
+      const relLines = rawLines.map((l) => toWorkspaceRelativeStatusLine(l, nestingDepth));
+      const hasTrackedChange = relLines.some(
+        (l) => l !== null && l.trim() !== "" && !/^(?:\?\?|!!) /.test(l)
+      );
+      if (!inHead && !hasTrackedChange) return null;
+      rawLines = relLines.filter((l) => l !== null);
     }
     statusLines = rawLines.filter((l) => {
       const trimmed = l.trim();
@@ -825,8 +882,13 @@ async function getGitSummary(workspaceDir, timeoutMs, gitExec = execBinaryAsync)
     branch = fallbackBranch ?? "HEAD";
   }
   const logLines = logOk ? logRes.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean) : [];
+  const branchNotes = [];
+  if (isUnborn) branchNotes.push("unborn, no commits yet");
+  if (isNested) {
+    branchNotes.push(`repo root: ${Array.from({ length: nestingDepth }, () => "..").join("/")}`);
+  }
   const parts = [
-    isUnborn ? `Git: branch \`${branch}\` (unborn, no commits yet)` : `Git: branch \`${branch}\``
+    `Git: branch \`${branch}\`${branchNotes.length > 0 ? ` (${branchNotes.join("; ")})` : ""}`
   ];
   if (!statusOk) {
     parts.push(
