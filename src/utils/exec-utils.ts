@@ -168,9 +168,9 @@ export function decodeProcessOutput(
 /**
  * agy aborts an MCP tool call after 180 s ("timed out after 3m0s") and drops
  * its result. All commands of one tool call share this budget; the remaining
- * 10 s cover the kill grace period below and response formatting.
+ * 30 s cover Windows process-tree kill grace, host scheduling, and formatting.
  */
-export const MCP_CALL_BUDGET_SEC = 170;
+export const MCP_CALL_BUDGET_SEC = 150;
 
 function killChildTree(pid: number | undefined, detached: boolean): NodeJS.Timeout | null {
   if (!pid) return null;

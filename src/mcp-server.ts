@@ -367,7 +367,7 @@ export function createAgyFastServer(
                 fileType: { type: "string" },
                 sortBy: { type: "string", enum: ["path", "mtime"] },
                 caseSensitive: { type: "boolean" },
-                contextLines: { type: "integer", minimum: 0, maximum: 5 },
+                contextLines: { type: "integer", minimum: 0, maximum: 10 },
                 maxResults: { type: "integer", minimum: 1, maximum: 200 },
               },
               required: ["type", "pattern"],

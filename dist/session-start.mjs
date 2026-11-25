@@ -199,7 +199,7 @@ function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
     return parts.join("");
   }
 }
-var MCP_CALL_BUDGET_SEC = 170;
+var MCP_CALL_BUDGET_SEC = 150;
 function killChildTree(pid, detached) {
   if (!pid) return null;
   if (process.platform === "win32") {

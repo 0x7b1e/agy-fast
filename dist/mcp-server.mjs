@@ -774,7 +774,7 @@ function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
     return parts.join("");
   }
 }
-var MCP_CALL_BUDGET_SEC = 170;
+var MCP_CALL_BUDGET_SEC = 150;
 function killChildTree(pid, detached) {
   if (!pid) return null;
   if (process.platform === "win32") {
@@ -2833,8 +2833,14 @@ async function walkFiles(rootDir, options = {}) {
   const includeHidden = options.includeHidden ?? false;
   const ignoreDirs = options.ignoreDirs ?? DEFAULT_IGNORE_DIRS;
   const fileFilter = options.fileFilter;
+  const timeoutMs = options.timeoutMs !== void 0 && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Math.max(1, Math.trunc(options.timeoutMs)) : null;
+  const deadline = timeoutMs !== null ? Date.now() + timeoutMs : null;
+  const maxDirs = options.maxDirs !== void 0 && Number.isFinite(options.maxDirs) && options.maxDirs > 0 ? Math.max(1, Math.trunc(options.maxDirs)) : null;
   const files = [];
   let truncated = false;
+  let timedOut = false;
+  let dirsTruncated = false;
+  let visitedDirs = 0;
   const MAX_CONCURRENT_READDIRS = 16;
   let activeReaddirs = 0;
   const waitQueue = [];
@@ -2848,13 +2854,33 @@ async function walkFiles(rootDir, options = {}) {
     truncated = true;
     drainWaiters();
   };
+  const withinBudget = () => {
+    if (truncated) return false;
+    if (deadline !== null && Date.now() >= deadline) {
+      timedOut = true;
+      markTruncated();
+      return false;
+    }
+    return true;
+  };
+  const timeoutTimer = timeoutMs !== null ? setTimeout(() => {
+    timedOut = true;
+    markTruncated();
+  }, timeoutMs) : null;
+  timeoutTimer?.unref();
   const readDirBounded = async (dir) => {
-    if (truncated) return null;
+    if (!withinBudget()) return null;
     while (activeReaddirs >= MAX_CONCURRENT_READDIRS) {
       await new Promise((resolve) => waitQueue.push(resolve));
-      if (truncated) return null;
+      if (!withinBudget()) return null;
     }
-    if (truncated) return null;
+    if (!withinBudget()) return null;
+    if (maxDirs !== null && visitedDirs >= maxDirs) {
+      dirsTruncated = true;
+      markTruncated();
+      return null;
+    }
+    visitedDirs++;
     activeReaddirs++;
     try {
       return await fs2.readdir(dir, { withFileTypes: true });
@@ -2869,14 +2895,14 @@ async function walkFiles(rootDir, options = {}) {
     }
   };
   const scanDir = async (dir, relDir) => {
-    if (truncated) return { localFiles: [], subdirs: [] };
+    if (!withinBudget()) return { localFiles: [], subdirs: [] };
     let entries;
     try {
       entries = await readDirBounded(dir);
     } catch {
       return { localFiles: [], subdirs: [] };
     }
-    if (!entries || truncated) return { localFiles: [], subdirs: [] };
+    if (!entries || !withinBudget()) return { localFiles: [], subdirs: [] };
     entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
     const localFiles = [];
     const subdirs = [];
@@ -2899,8 +2925,9 @@ async function walkFiles(rootDir, options = {}) {
     return { localFiles, subdirs };
   };
   async function visit(dir, relDir, depth, prefetched) {
-    if (truncated || depth > maxDepth) return;
+    if (!withinBudget() || depth > maxDepth) return;
     const { localFiles, subdirs } = await (prefetched ?? scanDir(dir, relDir));
+    if (!withinBudget()) return;
     for (const relPosix of localFiles) {
       if (files.length >= maxFiles) {
         markTruncated();
@@ -2910,11 +2937,11 @@ async function walkFiles(rootDir, options = {}) {
     }
     if (depth >= maxDepth || subdirs.length === 0) return;
     const batchSize = 8;
-    for (let i = 0; i < subdirs.length && !truncated; i += batchSize) {
+    for (let i = 0; i < subdirs.length && withinBudget(); i += batchSize) {
       const slice = subdirs.slice(i, i + batchSize);
       const prefetches = slice.map((sub) => scanDir(sub.abs, sub.rel));
       try {
-        for (let j = 0; j < slice.length && !truncated; j++) {
+        for (let j = 0; j < slice.length && withinBudget(); j++) {
           await visit(slice[j].abs, slice[j].rel, depth + 1, prefetches[j]);
         }
       } finally {
@@ -2924,8 +2951,17 @@ async function walkFiles(rootDir, options = {}) {
       }
     }
   }
-  await visit(rootDir, "", 0);
-  return { files, truncated };
+  try {
+    await visit(rootDir, "", 0);
+  } finally {
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+  }
+  return {
+    files,
+    truncated,
+    ...timedOut ? { timedOut: true } : {},
+    ...dirsTruncated ? { dirsTruncated: true } : {}
+  };
 }
 
 // src/tools/apply-edits.ts
@@ -4187,6 +4223,16 @@ function rankFuzzyPaths(query, candidates, maxResults) {
 }
 
 // src/tools/batch-search.ts
+var MAX_CONTEXT_LINES = 10;
+var DEFAULT_BATCH_SEARCH_CALL_TIMEOUT_MS = 6e4;
+var DEFAULT_WALK_TIMEOUT_MS = 12e3;
+var DEFAULT_WALK_MAX_DIRS = 2e4;
+function getRemainingMs(deadline) {
+  return Math.max(0, deadline - Date.now());
+}
+function getEffectiveWalkTimeoutMs(budget) {
+  return Math.min(budget.walkTimeoutMs, getRemainingMs(budget.callDeadline));
+}
 var READONLY_GIT_SUBCOMMANDS = /* @__PURE__ */ new Set([
   "status",
   "diff",
@@ -4577,9 +4623,9 @@ function fileTypeMatcher(fileType) {
   const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
   return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path5.basename(file)));
 }
-async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
+async function runTextOrRegexWithRg(query, searchRoot, baseCwd, budget) {
   const maxResults = clampInt(query.maxResults, 1, 200, 40);
-  const contextLines = clampInt(query.contextLines, 0, 5, 0);
+  const contextLines = clampInt(query.contextLines, 0, MAX_CONTEXT_LINES, 0);
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
   const typeGlobs = resolveFileTypeGlobs(query.fileType);
   const matchesType = fileTypeMatcher(query.fileType);
@@ -4650,12 +4696,29 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       args.push(`--glob=!**/${dir}/**`);
     }
   }
+  let rgTimedOut = false;
   const runRg = async (runArgs, opts) => {
+    const remainingMs = getRemainingMs(budget.callDeadline);
+    if (remainingMs <= 0) {
+      rgTimedOut = true;
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: true,
+        durationMs: 0,
+        stdout: "",
+        stderr: "",
+        truncated: false
+      };
+    }
     const res = await execBinaryAsync("rg", runArgs, {
       cwd: baseCwd,
-      timeoutMs: 15e3,
+      timeoutMs: Math.max(250, Math.min(15e3, remainingMs)),
       maxOutputBytes: 2 * 1024 * 1024
     });
+    if (res.timedOut) {
+      rgTimedOut = true;
+    }
     if (res.error) {
       throw new Error(`rg spawn error: ${res.error}`);
     }
@@ -4697,7 +4760,8 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     return {
       files: files2.slice(0, maxResults),
       totalMatches: 0,
-      truncated: files2.length > maxResults || cutShort(res)
+      truncated: files2.length > maxResults || cutShort(res),
+      ...rgTimedOut ? { budgetExceeded: true } : {}
     };
   }
   const maxCountArgs = query.multiline ? [] : ["--max-count", String(perFileCap + 1)];
@@ -4741,7 +4805,12 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     }
     truncated = cutShort(counts) || chosen.length < counted.length;
     if (chosen.length === 0) {
-      return { files: [], totalMatches: 0, truncated };
+      return {
+        files: [],
+        totalMatches: 0,
+        truncated,
+        ...rgTimedOut ? { budgetExceeded: true } : {}
+      };
     }
   }
   const toRgArgPath = (rawFile) => {
@@ -4861,7 +4930,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       break;
     }
     const fileCap = query.multiline ? maxResults : Math.min(count, perFileCap);
-    const budget = Math.min(fileCap, maxResults - totalMatches);
+    const budget2 = Math.min(fileCap, maxResults - totalMatches);
     const sorted = [...byFile.get(relFile)?.values() ?? []].sort(
       (a, b) => a.lineNumber - b.lineNumber
     );
@@ -4870,7 +4939,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     let lastKeptMatchLine = -1;
     for (const line of sorted) {
       if (line.isMatch) {
-        if (kept === budget) {
+        if (kept === budget2) {
           truncated = true;
           if (lastKeptMatchLine !== -1 && line.lineNumber <= lastKeptMatchLine + contextLines) {
             lines.push({ lineNumber: line.lineNumber, text: line.text, isMatch: false });
@@ -4880,7 +4949,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
         kept += 1;
         lastKeptMatchLine = line.lineNumber;
         lines.push(line);
-      } else if (kept < budget || line.lineNumber <= lastKeptMatchLine + contextLines) {
+      } else if (kept < budget2 || line.lineNumber <= lastKeptMatchLine + contextLines) {
         lines.push(line);
       }
     }
@@ -4888,7 +4957,12 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     files.push({ file: relFile, lines });
     totalMatches += kept;
   }
-  return { files, totalMatches, truncated };
+  return {
+    files,
+    totalMatches,
+    truncated,
+    ...rgTimedOut ? { budgetExceeded: true } : {}
+  };
 }
 function* multilineMatches(content, regex) {
   let previousEnd = -1;
@@ -4934,9 +5008,9 @@ function multilineMatchLines(content, regex, limit) {
   }
   return results;
 }
-async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
+async function runTextOrRegexWithNode(query, searchRoot, baseCwd, budget) {
   const maxResults = clampInt(query.maxResults, 1, 200, 40);
-  const contextLines = clampInt(query.contextLines, 0, 5, 0);
+  const contextLines = clampInt(query.contextLines, 0, MAX_CONTEXT_LINES, 0);
   const flags = (query.caseSensitive === false ? "i" : "") + (query.multiline ? "gmsu" : "");
   let regex;
   if (query.type === "regex") {
@@ -4980,6 +5054,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   const stat = await fs4.stat(searchRoot);
   const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
   let targetFiles;
+  let discoveryBudgetExceeded = false;
   if (stat.isFile()) {
     const relPosix = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
     targetFiles = globMatchesFile(relPosix) ? [{ abs: searchRoot, rel: relativeFile(baseCwd, searchRoot) }] : [];
@@ -4997,13 +5072,22 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
         for (const dir of targeted) ignoreDirs.delete(dir);
       }
     }
+    const walkRemainingMs = getEffectiveWalkTimeoutMs(budget);
+    if (walkRemainingMs <= 0) {
+      return { files: [], totalMatches: 0, truncated: true, budgetExceeded: true };
+    }
     const walked = await walkFiles(searchRoot, {
       maxFiles: 8e3,
       includeHidden,
       ignoreDirs,
-      fileFilter: globMatchesFile
+      fileFilter: globMatchesFile,
+      timeoutMs: walkRemainingMs,
+      maxDirs: budget.walkMaxDirs
     });
     discoveryTruncated = walked.truncated;
+    if (walked.timedOut || walked.dirsTruncated) {
+      discoveryBudgetExceeded = true;
+    }
     const rootRel = toPosixPath(path5.relative(baseCwd, searchRoot));
     const useFastPrefix = Boolean(
       rootRel === "" || !rootRel.startsWith("..") && !path5.isAbsolute(rootRel)
@@ -5068,7 +5152,13 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   };
   const batchSize = 16;
   let anyFileTruncated = false;
+  let scanTimedOut = false;
   for (let i = 0; i < targetFiles.length && !truncated; i += batchSize) {
+    if (Date.now() >= budget.callDeadline) {
+      scanTimedOut = true;
+      truncated = true;
+      break;
+    }
     const batch = targetFiles.slice(i, i + batchSize);
     const results = await Promise.all(
       batch.map(async ({ abs: absFile, rel: relFile }) => {
@@ -5166,7 +5256,8 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   return {
     files,
     totalMatches,
-    truncated: truncated || anyFileTruncated || discoveryTruncated
+    truncated: truncated || anyFileTruncated || discoveryTruncated,
+    ...discoveryBudgetExceeded || scanTimedOut ? { budgetExceeded: true } : {}
   };
 }
 function buildGlobFallbackPlan(pattern) {
@@ -5238,11 +5329,12 @@ async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sor
   const topDirs = [...dirCounts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).slice(0, 6).map(([dir, cnt]) => `${dir} (${cnt})`);
   const totalLabel = walked.truncated ? `${walked.files.length}+` : String(walked.files.length);
   const dirSummary = topDirs.length > 0 ? `; omitted dirs: ${topDirs.join(", ")}` : "";
+  const budgetNote = walked.timedOut || walked.dirsTruncated ? "; scan budget reached \u2014 narrow 'path' or 'glob'" : "";
   const suffix = `
-... [truncated at ${maxResults} of ${totalLabel} files${dirSummary}]`;
+... [truncated at ${maxResults} of ${totalLabel} files${dirSummary}${budgetNote}]`;
   return `${header}${items.join("\n")}${suffix}`;
 }
-async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
+async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget, budget) {
   const maxResults = clampInt(query.maxResults, 1, 300, 80);
   const pattern = query.pattern.trim() || "**/*";
   const matcher = globToRegExp(pattern);
@@ -5260,10 +5352,16 @@ ${rel}` : fallback2.emptyMessage;
     }
     return "(no files matched)";
   }
+  const walkRemainingMs = getEffectiveWalkTimeoutMs(budget);
+  if (walkRemainingMs <= 0) {
+    return "(no files matched before scan budget reached \u2014 narrow 'path' or 'glob')";
+  }
   const scanLimit = Math.max(maxResults + 1, 2e3);
   const walked = await walkFiles(searchRoot, {
     maxFiles: scanLimit,
     includeHidden,
+    timeoutMs: walkRemainingMs,
+    maxDirs: budget.walkMaxDirs,
     fileFilter: (relPosix) => {
       if (matcher.test(relPosix)) return true;
       if (matchBasename) {
@@ -5276,11 +5374,20 @@ ${rel}` : fallback2.emptyMessage;
   if (walked.files.length > 0) {
     return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, query.sortBy);
   }
+  if (walked.timedOut || walked.dirsTruncated) {
+    return "(no files matched before scan budget reached \u2014 narrow 'path' or 'glob')";
+  }
   const fallback = buildGlobFallbackPlan(pattern);
   if (fallback) {
+    const fallbackRemainingMs = getEffectiveWalkTimeoutMs(budget);
+    if (fallbackRemainingMs <= 0) {
+      return "(no files matched before scan budget reached \u2014 narrow 'path' or 'glob')";
+    }
     const fallbackWalked = await walkFiles(searchRoot, {
       maxFiles: scanLimit,
       includeHidden,
+      timeoutMs: fallbackRemainingMs,
+      maxDirs: budget.walkMaxDirs,
       fileFilter: (relPosix) => {
         const base = relPosix.split("/").pop() ?? relPosix;
         return fallback.match(relPosix, base);
@@ -5296,6 +5403,9 @@ ${rel}` : fallback2.emptyMessage;
         fallback.matchedNote
       );
     }
+    if (fallbackWalked.timedOut || fallbackWalked.dirsTruncated) {
+      return "(no files matched before scan budget reached \u2014 narrow 'path' or 'glob')";
+    }
     return fallback.emptyMessage;
   }
   return "(no files matched)";
@@ -5303,17 +5413,31 @@ ${rel}` : fallback2.emptyMessage;
 function relativeFile(baseCwd, file) {
   return toPosixPath(path5.relative(baseCwd, path5.resolve(baseCwd, file))) || path5.basename(file);
 }
-async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
+async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget, budget) {
   const pattern = query.pattern.trim();
   if (!pattern) throw new Error("Fuzzy pattern must not be blank");
   const matchesType = fileTypeMatcher(query.fileType);
   const maxResults = clampInt(query.maxResults, 1, 200, 30);
-  const walked = isFileTarget ? { files: [searchRoot], truncated: false } : await walkFiles(searchRoot, { maxFiles: 8e3, fileFilter: matchesType });
+  const walkRemainingMs = getEffectiveWalkTimeoutMs(budget);
+  if (!isFileTarget && walkRemainingMs <= 0) {
+    return "(no files matched before scan budget reached \u2014 narrow 'path')";
+  }
+  const walked = isFileTarget ? { files: [searchRoot], truncated: false, timedOut: false, dirsTruncated: false } : await walkFiles(searchRoot, {
+    maxFiles: 8e3,
+    fileFilter: matchesType,
+    timeoutMs: walkRemainingMs,
+    maxDirs: budget.walkMaxDirs
+  });
   const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path5.resolve(searchRoot, file)));
   const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
-  const body = matches.map((match) => match.path).join("\n") || "(no files matched)";
+  const budgetHit = Boolean(walked.timedOut || walked.dirsTruncated);
+  if (matches.length === 0) {
+    return budgetHit ? "(no files matched before scan budget reached \u2014 narrow 'path')" : "(no files matched)";
+  }
+  const body = matches.map((match) => match.path).join("\n");
+  const budgetNote = budgetHit ? "; scan budget reached \u2014 narrow 'path'" : "";
   const footer = walked.truncated || totalMatched > maxResults ? `
-... [truncated; showing ${matches.length} files]` : "";
+... [truncated; showing ${matches.length} files${budgetNote}]` : "";
   return body + footer;
 }
 var SHORTLOG_VALUE_FLAGS = /* @__PURE__ */ new Set([
@@ -5400,12 +5524,16 @@ function hardenGitExecArgs(validatedArgs) {
     ...subcmd ? [subcmd, ...subArgs] : subArgs
   ];
 }
-async function runGitQuery(query, searchRoot) {
+async function runGitQuery(query, searchRoot, budget) {
   const gitArgs = validateReadonlyGitArgs(query.pattern);
   const execArgs = hardenGitExecArgs(gitArgs);
+  const remainingMs = getRemainingMs(budget.callDeadline);
+  if (remainingMs <= 0) {
+    throw new Error("git query timed out");
+  }
   const res = await execBinaryAsync("git", execArgs, {
     cwd: searchRoot,
-    timeoutMs: 1e4,
+    timeoutMs: Math.max(250, Math.min(1e4, remainingMs)),
     maxOutputBytes: 512 * 1024,
     env: withNonInteractiveGitEnv()
   });
@@ -5888,7 +6016,7 @@ ${line.formatted}`);
   }
   return null;
 }
-async function executeSingleQuery(query, index, baseCwd, useRg) {
+async function executeSingleQuery(query, index, baseCwd, useRg, budget) {
   const header = `## Query ${index + 1} [${query.type}] ${query.pattern}${query.path ? ` (in ${query.path})` : ""}`;
   try {
     if (!query.pattern || typeof query.pattern !== "string") {
@@ -5912,17 +6040,17 @@ async function executeSingleQuery(query, index, baseCwd, useRg) {
     }
     if (query.type === "git") {
       const gitCwd = targetStat.isFile() ? path5.dirname(searchRoot) : searchRoot;
-      const out = await runGitQuery(query, gitCwd);
+      const out = await runGitQuery(query, gitCwd, budget);
       return { header, text: `${header}
 ${out}` };
     }
     if (query.type === "glob") {
-      const out = await runGlobQuery(query, searchRoot, baseCwd, targetStat.isFile());
+      const out = await runGlobQuery(query, searchRoot, baseCwd, targetStat.isFile(), budget);
       return { header, text: `${header}
 ${out}` };
     }
     if (query.type === "fuzzy") {
-      const out = await runFuzzyQuery(query, searchRoot, baseCwd, targetStat.isFile());
+      const out = await runFuzzyQuery(query, searchRoot, baseCwd, targetStat.isFile(), budget);
       return { header, text: `${header}
 ${out}` };
     }
@@ -5930,26 +6058,28 @@ ${out}` };
       let res;
       if (useRg) {
         try {
-          res = await runTextOrRegexWithRg(query, searchRoot, baseCwd);
+          res = await runTextOrRegexWithRg(query, searchRoot, baseCwd, budget);
         } catch (err) {
           if (err instanceof Error && err.message.startsWith("rg spawn error:")) {
-            res = await runTextOrRegexWithNode(query, searchRoot, baseCwd);
+            res = await runTextOrRegexWithNode(query, searchRoot, baseCwd, budget);
           } else {
             throw err;
           }
         }
       } else {
-        res = await runTextOrRegexWithNode(query, searchRoot, baseCwd);
+        res = await runTextOrRegexWithNode(query, searchRoot, baseCwd, budget);
       }
+      const budgetNote = res.budgetExceeded ? "; scan budget reached \u2014 narrow 'path' or 'glob'" : "";
       if (query.outputMode === "count" || query.outputMode === "files_with_matches") {
-        const body = res.files.map(({ file, count }) => query.outputMode === "count" ? `${file}: ${count} ${query.multiline ? "matches" : "matching lines"}` : file).join("\n") || "(no matches)";
-        const footer = res.truncated ? `
-... [truncated; showing ${res.files.length} files]` : "";
+        const body = res.files.map(({ file, count }) => query.outputMode === "count" ? `${file}: ${count} ${query.multiline ? "matches" : "matching lines"}` : file).join("\n") || (res.budgetExceeded ? "(no matches before scan budget reached \u2014 narrow 'path' or 'glob')" : "(no matches)");
+        const footer = res.truncated && res.files.length > 0 ? `
+... [truncated; showing ${res.files.length} files${budgetNote}]` : "";
         return { header, text: `${header}
 ${body}${footer}` };
       }
+      const formattedBody = res.files.length === 0 && res.budgetExceeded ? "(no matches before scan budget reached \u2014 narrow 'path' or 'glob')" : formatFileMatches(res.files, res.totalMatches, res.truncated) + (res.budgetExceeded && res.files.length > 0 ? "\n... [scan budget reached \u2014 narrow 'path' or 'glob']" : "");
       const text = `${header}
-${formatFileMatches(res.files, res.totalMatches, res.truncated)}`;
+${formattedBody}`;
       return {
         header,
         text,
@@ -5957,7 +6087,7 @@ ${formatFileMatches(res.files, res.totalMatches, res.truncated)}`;
           files: res.files,
           totalMatches: res.totalMatches,
           truncated: res.truncated,
-          contextLines: clampInt(query.contextLines, 0, 5, 0)
+          contextLines: clampInt(query.contextLines, 0, MAX_CONTEXT_LINES, 0)
         } : void 0
       };
     }
@@ -6042,8 +6172,16 @@ async function runBatchSearch(input, options = {}) {
     (q) => q.type === "text" || q.type === "regex"
   );
   const useRg = needsTextSearch && !options.forceNodeFallback && await isRipgrepAvailable();
+  const callTimeoutMs = options.callTimeoutMs !== void 0 && Number.isFinite(options.callTimeoutMs) && options.callTimeoutMs > 0 ? Math.max(1, Math.trunc(options.callTimeoutMs)) : DEFAULT_BATCH_SEARCH_CALL_TIMEOUT_MS;
+  const walkTimeoutMs = options.walkTimeoutMs !== void 0 && Number.isFinite(options.walkTimeoutMs) && options.walkTimeoutMs > 0 ? Math.max(1, Math.trunc(options.walkTimeoutMs)) : DEFAULT_WALK_TIMEOUT_MS;
+  const walkMaxDirs = options.walkMaxDirs !== void 0 && Number.isFinite(options.walkMaxDirs) && options.walkMaxDirs > 0 ? Math.max(1, Math.trunc(options.walkMaxDirs)) : DEFAULT_WALK_MAX_DIRS;
+  const budget = {
+    callDeadline: Date.now() + callTimeoutMs,
+    walkTimeoutMs,
+    walkMaxDirs
+  };
   const executed = await Promise.all(
-    queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg))
+    queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg, budget))
   );
   const separator = "\n\n";
   const rawSections = executed.map((e) => e.text);
@@ -10197,7 +10335,7 @@ function createAgyFastServer(options = {}) {
                 fileType: { type: "string" },
                 sortBy: { type: "string", enum: ["path", "mtime"] },
                 caseSensitive: { type: "boolean" },
-                contextLines: { type: "integer", minimum: 0, maximum: 5 },
+                contextLines: { type: "integer", minimum: 0, maximum: 10 },
                 maxResults: { type: "integer", minimum: 1, maximum: 200 }
               },
               required: ["type", "pattern"]
