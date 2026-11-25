@@ -2623,6 +2623,7 @@ function readSavedEditsFormatSync(env = process.env) {
 }
 
 // src/tools/apply-edits.ts
+import { isUtf8 } from "node:buffer";
 import { promises as fs3 } from "node:fs";
 import path4 from "node:path";
 
@@ -4060,6 +4061,12 @@ async function runApplyEdits(input) {
     } catch (err) {
       errors.push(
         `${item.relPath}: ${err instanceof Error ? err.message : String(err)}`
+      );
+      continue;
+    }
+    if (!isUtf8(fileData.rawBuffer)) {
+      errors.push(
+        `${item.relPath}: file is not valid UTF-8 (hunk edits would corrupt non-UTF-8 bytes; convert to UTF-8 first or rewrite the whole file with create + overwrite: true)`
       );
       continue;
     }

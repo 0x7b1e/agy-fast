@@ -1,3 +1,4 @@
+import { isUtf8 } from "node:buffer";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
@@ -1365,6 +1366,12 @@ export async function runApplyEdits(
     } catch (err) {
       errors.push(
         `${item.relPath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      continue;
+    }
+    if (!isUtf8(fileData.rawBuffer)) {
+      errors.push(
+        `${item.relPath}: file is not valid UTF-8 (hunk edits would corrupt non-UTF-8 bytes; convert to UTF-8 first or rewrite the whole file with create + overwrite: true)`,
       );
       continue;
     }
