@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -683,6 +683,96 @@ describe("installer", () => {
       assert.equal(backToLazy.mcpServers.fast.tools, undefined);
     } finally {
       await fs.rm(modeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to atomic in-place sync on EBUSY/EPERM copied dir and fails clearly for --link", async () => {
+    const busyHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-ebusy-"));
+    const env = makeIsolatedEnv(busyHome);
+    const targetDir = path.join(busyHome, ".gemini", "config", "plugins", "agy-fast");
+    let locker: ReturnType<typeof spawn> | null = null;
+    try {
+      execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "install", "--no-enable", "--no-acp"],
+        { env, encoding: "utf8" },
+      );
+      const customRuleContent = "---\ntrigger: always_on\n---\nkeep-me\n";
+      await fs.writeFile(path.join(targetDir, "rules", "custom.local.md"), customRuleContent, "utf8");
+      const targetManifestPath = path.join(targetDir, "plugin.json");
+      const beforeManifest = JSON.parse(await fs.readFile(targetManifestPath, "utf8"));
+      await fs.writeFile(
+        targetManifestPath,
+        JSON.stringify({ ...beforeManifest, version: "0.0.1-old" }, null, 2),
+        "utf8",
+      );
+
+      // Hold a cwd lock inside targetDir (on Windows this causes EBUSY on rename/rmdir)
+      locker = spawn(process.execPath, ["-e", 'console.log("READY"); setInterval(() => {}, 1000);'], {
+        cwd: path.join(targetDir, "dist"),
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
+      });
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("locker did not emit READY")), 5000);
+        locker!.stdout!.on("data", (chunk: Buffer) => {
+          if (chunk.toString("utf8").includes("READY")) {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+        locker!.once("error", (e) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+      });
+
+      const reinstallOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "install", "--no-enable", "--no-acp"],
+        { env, encoding: "utf8" },
+      );
+      assert.match(reinstallOut, /Installed agy-fast/);
+      if (process.platform === "win32") {
+        assert.match(reinstallOut, /updated files atomically in-place/i);
+      }
+      const afterManifest = JSON.parse(await fs.readFile(targetManifestPath, "utf8"));
+      assert.equal(afterManifest.version, beforeManifest.version);
+      assert.equal(
+        await fs.readFile(path.join(targetDir, "rules", "custom.local.md"), "utf8"),
+        customRuleContent,
+      );
+      const targetEntries = await fs.readdir(targetDir);
+      assert.equal(targetEntries.some((n) => n.includes(".agy-tmp.")), false);
+      const parentEntries = await fs.readdir(path.dirname(targetDir));
+      assert.equal(parentEntries.some((n) => n.includes(".agy-trash-")), false);
+
+      if (process.platform === "win32") {
+        assert.throws(
+          () =>
+            execFileSync(
+              process.execPath,
+              [INSTALL_SCRIPT, "install", "--link", "--no-enable", "--no-acp"],
+              { env, encoding: "utf8" },
+            ),
+          /Close the running host\/MCP process/i,
+        );
+        // Atomic rename failed before deleting plugin.json / custom.local.md, so both remain intact
+        assert.equal(
+          await fs.readFile(path.join(targetDir, "rules", "custom.local.md"), "utf8"),
+          customRuleContent,
+        );
+        assert.equal(JSON.parse(await fs.readFile(targetManifestPath, "utf8")).name, "agy-fast");
+      }
+    } finally {
+      if (locker && locker.exitCode === null) {
+        const closed = new Promise<void>((resolve) => {
+          locker!.once("close", () => resolve());
+        });
+        locker.kill("SIGKILL");
+        await closed;
+      }
+      await fs.rm(busyHome, { recursive: true, force: true }).catch(() => {});
     }
   });
 });
