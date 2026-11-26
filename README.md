@@ -19,7 +19,7 @@
 [![Glama MCP Server](https://glama.ai/mcp/servers/INK-Q/agy-fast/badges/score.svg)](https://glama.ai/mcp/servers/INK-Q/agy-fast)
 [![HOL Guard Verified](https://img.shields.io/endpoint?url=https%3A%2F%2Fhol.org%2Fapi%2Fregistry%2Fbadges%2Fplugin%3Fslug%3Dink-q%252Fagy-fast%26metric%3Dscore&style=flat-square&labelColor=0F172A)](https://hol.org/registry/plugins/ink-q%2Fagy-fast?utm_source=hol_marketplace&utm_medium=plugins_badge&utm_campaign=plugins&utm_content=ink-q%2Fagy-fast&ref=plugin-author-5dc88d78)
 
-English · [简体中文](README.zh-CN.md) · [Quick Start](#quick-start) · [Benchmarks](#real-world-benchmarks) · [MCP Tools](#the-5-mcp-tools) · [Analysis Report](docs/ANALYSIS_REPORT.md) · [Changelog](CHANGELOG.md)
+English · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md) · [Quick Start](#quick-start) · [Benchmarks](#real-world-benchmarks) · [MCP Tools](#the-5-mcp-tools) · [Analysis Report](docs/ANALYSIS_REPORT.md) · [Changelog](CHANGELOG.md)
 
 </div>
 
@@ -215,7 +215,7 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 - **Outlines + piggybacked slices:** Supports the same 15-format outlines (with breadth-first water-filling per file) plus optional tiny `[startLine, endLine]` slices in one call under the `≤8.8 KB` UTF-8 budget, while steering bulk range reads (`>150` lines) to parallel built-in `read_file`.
 
 ### 5. `run_checks` — Concurrent Build, Lint, Test & Diagnostic Runner
-- **Up to 12 commands per call:** Executes independent non-interactive shell commands in a bounded worker pool (`concurrency: 1..8`) with per-command timeouts (`1..170 s`, sharing a `170 s` call budget under Antigravity's `180 s` MCP limit), ANSI escape stripping, and transparent Windows unwrapping of trivial `powershell -Command "..."` wrappers around allowlisted binaries (`git`, `npm`, `node`, `rg`, `pytest`, `cargo`, etc.) to skip PowerShell cold-start overhead while leaving PowerShell cmdlets/aliases untouched.
+- **Up to 12 commands per call:** Executes independent non-interactive shell commands in a bounded worker pool (`concurrency: 1..8`) with per-command timeouts (`1..150 s`, sharing a `150 s` call budget under Antigravity's `180 s` MCP limit), ANSI escape stripping, and transparent Windows unwrapping of trivial `powershell -Command "..."` wrappers around allowlisted binaries (`git`, `npm`, `node`, `rg`, `pytest`, `cargo`, etc.) to skip PowerShell cold-start overhead while leaving PowerShell cmdlets/aliases untouched.
 - **Head-Tail adaptive output modes:** `compact` (default) collapses passing commands to 1-line summaries and uses **Head-Tail folding** on large failures so both initial root-cause errors and final summary/stack tails survive the `≤8.8 KB` inline cap; `full` preserves stdout for diagnostic or audit scripts with Head-Tail folding when capped.
 
 <details>
@@ -258,6 +258,7 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 | **Configure auto-update** *(`auto` \| `notify` \| `off`)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --auto-update notify --interval 24` |
 | **Switch MCP tool loading** *(`eager` \| `lazy`, preserved across updates)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --tool-loading lazy` |
 | **Direct CLI mode** *(for Swarm workers & non-MCP scripts)* | `node ~/.gemini/config/plugins/agy-fast/dist/mcp-server.mjs --cli <search\|outline\|slice\|edit\|check>` |
+| **Standalone MCP stdio server** *(standard MCP hosts; forwards flags like `--schema-compat=minimal`)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs mcp` *(or `agy-fast-mcp`)* |
 | **Uninstall cleanly** | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs uninstall` |
 
 > From a local repository clone, `./install.sh <command>` (macOS/Linux) and `.\install.ps1 <command>` (Windows) accept the same subcommands (`doctor`, `update`, `config`, `uninstall`).
@@ -279,6 +280,7 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 | `AGY_FAST_REPO` | Git URL | Use a custom mirror or fork |
 | `AGY_FAST_EDITS_FORMAT` | `auto` *(default)* \| `array` \| `string` | Controls `apply_edits.edits` schema (`auto` uses token-saving native arrays on eager-capable CLI ≥1.5.8, Desktop 2.0, IDE, and third-party hosts, and switches to JSON array strings on pre-eager CLI 1.5.0–1.5.7; server always accepts both) |
 | `AGY_FAST_HOST` | e.g. `cli@1.5.14`, `ide@2.7.0`, `desktop@2.34.0` | Overrides auto-detected Antigravity host surface & version |
+| `AGY_FAST_SCHEMA_COMPAT` | `standard` *(default)* \| `minimal` | Strips numeric/array range keywords (`minimum`/`maximum`/`minItems`/`maxItems`) from `tools/list` for strict JSON Schema subset hosts (also `--schema-compat=minimal`; runtime validation stays unchanged) |
 
 **Applying updates:** Updated `rules/AGENTS.md` and `dist/session-start.mjs` take effect automatically on the next new session. In Antigravity Desktop 2.0 / IDE, reload or restart the window once to refresh the resident MCP server process.
 

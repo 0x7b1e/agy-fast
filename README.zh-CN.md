@@ -19,7 +19,7 @@
 [![Glama MCP Server](https://glama.ai/mcp/servers/INK-Q/agy-fast/badges/score.svg)](https://glama.ai/mcp/servers/INK-Q/agy-fast)
 [![HOL Guard Verified](https://img.shields.io/endpoint?url=https%3A%2F%2Fhol.org%2Fapi%2Fregistry%2Fbadges%2Fplugin%3Fslug%3Dink-q%252Fagy-fast%26metric%3Dscore&style=flat-square&labelColor=0F172A)](https://hol.org/registry/plugins/ink-q%2Fagy-fast?utm_source=hol_marketplace&utm_medium=plugins_badge&utm_campaign=plugins&utm_content=ink-q%2Fagy-fast&ref=plugin-author-5dc88d78)
 
-[English](README.md) · 简体中文 · [快速开始](#快速开始) · [实测数据](#实测数据) · [MCP 工具](#5-个核心-mcp-工具) · [性能分析报告](docs/ANALYSIS_REPORT.zh-CN.md) · [更新日志](CHANGELOG.md)
+[English](README.md) · 简体中文 · [繁體中文](README.zh-TW.md) · [快速开始](#快速开始) · [实测数据](#实测数据) · [MCP 工具](#5-个核心-mcp-工具) · [性能分析报告](docs/ANALYSIS_REPORT.zh-CN.md) · [更新日志](CHANGELOG.md)
 
 </div>
 
@@ -213,7 +213,7 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 - **大纲与小切片合一**：支持同等 15 种格式符号大纲（支持单文件广度优先水填充分配），并可在同一次请求中顺带读取少量小行段（总输出死守 `≤8.8 KB` UTF-8 上限）；大段正文读取自动引导至并行内置 `read_file`。
 
 ### 5. `run_checks` — 并发构建、规范检查、测试与诊断执行器
-- **单次最多 12 条命令**：在受控并发池（`concurrency: 1..8`）中并行执行独立非交互命令，支持单条超时强杀（`1..170 s`，单次调用共享 `170 s` 预算以适配 Antigravity `180 s` MCP 上限）、ANSI 转义符清理，并在 Windows 下自动透明解包针对白名单 CLI（`git`/`npm`/`node`/`rg`/`pytest`/`cargo` 等）的冗余 `powershell -Command "..."` 包装，免去 PowerShell 冷启动开销（PowerShell cmdlet、别名与管道完全原样保留）。
+- **单次最多 12 条命令**：在受控并发池（`concurrency: 1..8`）中并行执行独立非交互命令，支持单条超时强杀（`1..150 s`，单次调用共享 `150 s` 预算以适配 Antigravity `180 s` MCP 上限）、ANSI 转义符清理，并在 Windows 下自动透明解包针对白名单 CLI（`git`/`npm`/`node`/`rg`/`pytest`/`cargo` 等）的冗余 `powershell -Command "..."` 包装，免去 PowerShell 冷启动开销（PowerShell cmdlet、别名与管道完全原样保留）。
 - **头尾折叠（Head-Tail）双输出模式**：默认 `compact` 模式将通过项折叠为 1 行摘要、超长失败日志采用**头尾折叠**（同时保留首条根因报错与末尾测试汇总/堆栈尾部）；`full` 模式在 `≤8.8 KB` 预算内保留标准输出，超限时同样采用头尾折叠。
 
 <details>
@@ -256,6 +256,7 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | **配置自动更新策略** *（`auto` \| `notify` \| `off`）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --auto-update notify --interval 24` |
 | **切换 MCP 工具加载模式** *（`eager` \| `lazy`，自动更新保留）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --tool-loading lazy` |
 | **CLI 直调模式** *（供 Swarm Worker 及无 MCP 环境通过 `run_command` 调用）* | `node ~/.gemini/config/plugins/agy-fast/dist/mcp-server.mjs --cli <search\|outline\|slice\|edit\|check>` |
+| **独立 MCP Stdio 服务** *（供标准 MCP 客户端按需挂载；透传 `--schema-compat=minimal` 等参数）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs mcp` *（或 `agy-fast-mcp`）* |
 | **一键干净卸载** | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs uninstall` |
 
 > 在本地克隆目录中，也可直接使用 `./install.sh <子命令>`（macOS/Linux）或 `.\install.ps1 <子命令>`（Windows）执行上述全部子命令。
@@ -277,6 +278,7 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | `AGY_FAST_REPO` | Git 仓库地址 | 自定义镜像或 Fork 仓库地址 |
 | `AGY_FAST_EDITS_FORMAT` | `auto` *（默认）* \| `array` \| `string` | 控制 `apply_edits.edits` 参数格式策略（`auto` 在支持 `"eager": true` 的 CLI ≥1.5.8、桌面端 2.0、IDE 与第三方客户端统一走省 token 的强类型原生数组，在旧版懒加载 CLI 1.5.0–1.5.7 自动切换为 JSON 数组字符串以防 `[]` 丢参；服务端始终同时兼容两种格式） |
 | `AGY_FAST_HOST` | 如 `cli@1.5.14`、`ide@2.7.0`、`desktop@2.34.0` | 手动覆盖自动探测到的 Antigravity 宿主端类型与版本 |
+| `AGY_FAST_SCHEMA_COMPAT` | `standard` *（默认）* \| `minimal` | 从 `tools/list` 剥离数值/数组范围约束关键字（`minimum`/`maximum`/`minItems`/`maxItems`），适配严格 JSON Schema 子集宿主（亦支持 `--schema-compat=minimal`，运行时校验不受影响） |
 
 **更新生效提示：** 新版 `rules/AGENTS.md` 与 `dist/session-start.mjs` 在下一次开启新会话时自动生效；Antigravity Desktop 2.0 / IDE 若需立即刷新常驻 MCP 服务，重载窗口或重启一次即可。
 
