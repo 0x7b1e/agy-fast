@@ -260,16 +260,36 @@ describe("apply_edits", () => {
     const realFile = path.join(tmpDir, "real-target.txt");
     const symFile = path.join(tmpDir, "sym-link.txt");
     await fs.writeFile(realFile, "hello link\n", "utf8");
-    await fs.symlink(realFile, symFile);
+    let hasFileSymlink = false;
+    try {
+      await fs.symlink(realFile, symFile);
+      hasFileSymlink = true;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (process.platform !== "win32" || (code !== "EPERM" && code !== "ENOTSUP")) {
+        throw err;
+      }
+    }
+
+    const edits: Array<{
+      path: string;
+      hunks?: Array<{ target: string; replacement: string }>;
+      create?: string;
+    }> = [
+      { path: "tool.sh", hunks: [{ target: "v1", replacement: "v2" }] },
+      { path: "real-target.txt", hunks: [{ target: "link", replacement: "target" }] },
+      { path: "single-line.txt", create: "only one line\n" },
+    ];
+    if (hasFileSymlink) {
+      edits.splice(1, 0, {
+        path: "sym-link.txt",
+        hunks: [{ target: "hello", replacement: "updated" }],
+      });
+    }
 
     const editRes = await runApplyEdits({
       cwd: tmpDir,
-      edits: [
-        { path: "tool.sh", hunks: [{ target: "v1", replacement: "v2" }] },
-        { path: "sym-link.txt", hunks: [{ target: "hello", replacement: "updated" }] },
-        { path: "real-target.txt", hunks: [{ target: "link", replacement: "target" }] },
-        { path: "single-line.txt", create: "only one line\n" },
-      ],
+      edits,
     });
 
     assert.equal(editRes.isError, false);
@@ -278,8 +298,12 @@ describe("apply_edits", () => {
     if (process.platform !== "win32") {
       assert.equal((await fs.stat(scriptPath)).mode & 0o777, 0o755);
     }
-    assert.equal((await fs.lstat(symFile)).isSymbolicLink(), true);
-    assert.equal(await fs.readFile(realFile, "utf8"), "updated target\n");
+    if (hasFileSymlink) {
+      assert.equal((await fs.lstat(symFile)).isSymbolicLink(), true);
+      assert.equal(await fs.readFile(realFile, "utf8"), "updated target\n");
+    } else {
+      assert.equal(await fs.readFile(realFile, "utf8"), "hello target\n");
+    }
 
     const badLine = await runApplyEdits({
       cwd: tmpDir,

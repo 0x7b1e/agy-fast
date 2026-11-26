@@ -21,6 +21,7 @@ function buildCleanServerEnv(
   delete env.AGY_FAST_CACHE_DIR;
   delete env.PLUGIN_ROOT;
   delete env.AGY_PLUGIN_ROOT;
+  delete env.NODE_USE_ENV_PROXY;
   for (const [k, v] of Object.entries(extraEnv)) {
     if (v === undefined) delete env[k];
     else env[k] = v;
@@ -666,6 +667,7 @@ describe("MCP Stdio Server end-to-end", () => {
       await new Promise<void>((resolve, reject) => {
         const child = spawn(process.execPath, [MCP_SERVER_SCRIPT], {
           stdio: ["pipe", "pipe", "pipe"],
+          env: buildCleanServerEnv(),
           windowsHide: true,
         });
         let buf = "";

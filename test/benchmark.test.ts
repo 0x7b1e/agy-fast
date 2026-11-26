@@ -384,19 +384,30 @@ describe("benchmark analyzer & CLI", () => {
     // Symlinked transcript files & session dirs are collected, deduplicated, and cycle-safe
     const symlinkDir = path.join(tmpDir, "symlink-runs");
     await fs.mkdir(symlinkDir, { recursive: true });
-    await fs.symlink(
-      path.join(sess1Logs, "transcript_full.jsonl"),
-      path.join(symlinkDir, "s1-link.jsonl"),
-    );
+    try {
+      await fs.symlink(
+        path.join(sess1Logs, "transcript_full.jsonl"),
+        path.join(symlinkDir, "s1-link.jsonl"),
+      );
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (process.platform !== "win32" || (code !== "EPERM" && code !== "ENOTSUP")) {
+        throw err;
+      }
+    }
+
+    const dirLinkType = process.platform === "win32" ? "junction" : "dir";
     await fs.symlink(
       path.join(brainDir, "sess-1"),
       path.join(symlinkDir, "s1-dir-link"),
+      dirLinkType,
     );
     await fs.symlink(
       path.join(brainDir, "sess-2"),
       path.join(symlinkDir, "s2-dir-link"),
+      dirLinkType,
     );
-    await fs.symlink(symlinkDir, path.join(symlinkDir, "self-loop"));
+    await fs.symlink(symlinkDir, path.join(symlinkDir, "self-loop"), dirLinkType);
 
     const symlinkFiles = await collectTranscriptFiles([symlinkDir]);
     assert.equal(symlinkFiles.length, 2);

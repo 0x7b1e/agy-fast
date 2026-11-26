@@ -36,8 +36,26 @@ for (const file of entries) {
   outFiles.push(outFile);
 }
 
-const res = spawnSync(process.execPath, ["--test", ...outFiles], {
+const testEnv = { ...process.env };
+delete testEnv.NODE_USE_ENV_PROXY;
+const [nodeMajor, nodeMinor] = process.versions.node.split(".").map(Number);
+const supportsTestConcurrency = nodeMajor > 20 || (nodeMajor === 20 && nodeMinor >= 10);
+const envConcurrency = Number.parseInt(process.env.AGY_FAST_TEST_CONCURRENCY ?? "", 10);
+const concurrencyArgs = supportsTestConcurrency
+  ? Number.isInteger(envConcurrency) && envConcurrency > 0
+    ? [`--test-concurrency=${envConcurrency}`]
+    : !process.env.CI && process.platform === "win32"
+      ? ["--test-concurrency=2"]
+      : []
+  : [];
+const testArgs = [
+  "--test",
+  ...concurrencyArgs,
+  ...outFiles,
+];
+const res = spawnSync(process.execPath, testArgs, {
   cwd: rootDir,
+  env: testEnv,
   stdio: "inherit",
 });
 
