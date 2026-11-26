@@ -948,7 +948,55 @@ describe("installer", () => {
       assert.doesNotMatch(subsetRulesOut, /`read_slices`/);
       assert.doesNotMatch(subsetRulesOut, /mcp_agy-fast_fast_|call_mcp_tool|toolSummary|SessionStart/);
 
-      // 4. Invalid --host, --tools without --rules, or cross-command flags fail fast
+      // 4. --tools wires server-side --tools args (and filters Antigravity eager map)
+      const filteredJsonOut = execFileSync(
+        process.execPath,
+        [
+          INSTALL_SCRIPT,
+          "mcp-config",
+          "--quiet",
+          "--host",
+          "json",
+          "--tools",
+          "batch_search,quick_outline",
+          "--schema-compat=minimal",
+          "--target",
+          customTarget,
+        ],
+        { env, encoding: "utf8" },
+      );
+      assert.deepEqual(JSON.parse(filteredJsonOut).mcpServers["agy-fast"], {
+        command: "node",
+        args: [expectedPosix, "--tools", "batch_search,quick_outline", "--schema-compat=minimal"],
+      });
+
+      const filteredAgyOut = execFileSync(
+        process.execPath,
+        [
+          INSTALL_SCRIPT,
+          "mcp-config",
+          "--quiet",
+          "--host",
+          "antigravity",
+          "--tools",
+          "batch_search,quick_outline",
+          "--target",
+          customTarget,
+        ],
+        { env, encoding: "utf8" },
+      );
+      const filteredAgyCfg = JSON.parse(filteredAgyOut);
+      assert.deepEqual(filteredAgyCfg.mcpServers.fast.args, [
+        expectedPosix,
+        "--tools",
+        "batch_search,quick_outline",
+      ]);
+      assert.deepEqual(Object.keys(filteredAgyCfg.mcpServers.fast.tools), [
+        "batch_search",
+        "quick_outline",
+      ]);
+
+      // 5. Invalid --host, trailing comma in --tools, or cross-command flags fail fast
       assert.throws(
         () =>
           execFileSync(process.execPath, [INSTALL_SCRIPT, "mcp-config", "--host", "codex"], {
@@ -959,11 +1007,11 @@ describe("installer", () => {
       );
       assert.throws(
         () =>
-          execFileSync(process.execPath, [INSTALL_SCRIPT, "mcp-config", "--tools", "batch_search"], {
+          execFileSync(process.execPath, [INSTALL_SCRIPT, "mcp-config", "--tools", "batch_search,"], {
             env,
             encoding: "utf8",
           }),
-        /only supported with --rules/,
+        /empty tool entry/i,
       );
       assert.throws(
         () =>

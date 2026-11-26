@@ -17,6 +17,10 @@
     "agy-fast": "./scripts/install.mjs",
     "agy-fast-mcp": "./dist/mcp-server.mjs"
   },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "files": [
     "plugin.json",
     "mcp_config.json",

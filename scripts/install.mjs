@@ -355,7 +355,7 @@ Options:
   --host <target>               (mcp-config) Target JSON format: mcp-only | json | generic | antigravity
   --schema-compat standard|minimal
                                 (mcp-config) Include --schema-compat=minimal in emitted args
-  --tools <list>                (mcp-config --rules) Comma-separated tool subset for rules template
+  --tools <list>                (mcp-config) Comma-separated tool subset for server args and rules
   --rules                       (mcp-config) Print host-agnostic Markdown routing rules
   -h, --help                    Show this help
 `);
@@ -1885,13 +1885,16 @@ async function runUninstall(opts) {
 
 function parseMcpConfigTools(rawTools) {
   if (rawTools === null) return null;
-  const parts = rawTools
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (parts.length === 0) {
+  const trimmed = String(rawTools).trim();
+  if (!trimmed) {
     throw new Error(
       `Invalid --tools value "${rawTools}". Expected comma-separated tool names from: ${EXPECTED_MCP_TOOLS.join(", ")}.`,
+    );
+  }
+  const parts = trimmed.split(",").map((s) => s.trim());
+  if (parts.some((p) => !p)) {
+    throw new Error(
+      `Invalid --tools value "${rawTools}": empty tool entry in comma-separated list. Valid tools: ${EXPECTED_MCP_TOOLS.join(", ")}.`,
     );
   }
   const invalid = parts.filter((name) => !EXPECTED_MCP_TOOLS.includes(name));
@@ -1916,19 +1919,23 @@ async function resolveMcpEntryPosix(opts) {
   return { posix: chosen.split(path.sep).join("/"), exists };
 }
 
-function renderMcpConfigSnippet(host, mcpEntryPosix, opts) {
-  const args =
-    opts.schemaCompat === "minimal"
-      ? [mcpEntryPosix, "--schema-compat=minimal"]
-      : [mcpEntryPosix];
+function renderMcpConfigSnippet(host, mcpEntryPosix, opts, selectedTools = null) {
+  const args = [mcpEntryPosix];
+  if (selectedTools !== null) {
+    args.push("--tools", selectedTools.join(","));
+  }
+  if (opts.schemaCompat === "minimal") {
+    args.push("--schema-compat=minimal");
+  }
   if (host === "antigravity") {
     const serverCfg = {
       command: "node",
       args,
     };
     if (opts.toolLoading !== "lazy") {
+      const eagerTools = selectedTools ?? EXPECTED_MCP_TOOLS;
       serverCfg.tools = Object.fromEntries(
-        EXPECTED_MCP_TOOLS.map((name) => [name, { eager: true }]),
+        eagerTools.map((name) => [name, { eager: true }]),
       );
     }
     return `${JSON.stringify(
@@ -2052,12 +2059,7 @@ function renderGenericRulesTemplate(selectedTools, mcpEntryPosix) {
 async function runMcpConfig(opts) {
   const host = opts.mcpHost || "mcp-only";
   const tools = parseMcpConfigTools(opts.mcpToolsRaw);
-  if (!opts.printRules && tools !== null) {
-    throw new Error(
-      "--tools in 'mcp-config' is only supported with --rules until server-side --tools filtering lands.",
-    );
-  }
-  if (opts.printRules && opts.mcpHost) {
+  if (opts.printRules && opts.mcpHost && !opts.quiet) {
     console.error(`Warning: --host '${opts.mcpHost}' is ignored when --rules is set.`);
   }
   const entry = await resolveMcpEntryPosix(opts);
@@ -2070,7 +2072,7 @@ async function runMcpConfig(opts) {
     process.stdout.write(renderGenericRulesTemplate(tools, entry.posix));
     return;
   }
-  process.stdout.write(renderMcpConfigSnippet(host, entry.posix, opts));
+  process.stdout.write(renderMcpConfigSnippet(host, entry.posix, opts, tools));
 }
 
 async function main() {
