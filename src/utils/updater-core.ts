@@ -853,10 +853,13 @@ export async function verifyStagedPlugin(stagingDir: string): Promise<{
 
   // Live MCP handshake smoke test on staged bundle before replacing live files
   const mcpPath = path.join(stagingDir, "dist", "mcp-server.mjs");
+  const cleanMcpEnv = { ...process.env };
+  delete cleanMcpEnv.AGY_FAST_TOOLS;
   const smokeOk = await new Promise<boolean>((resolve) => {
     const child = spawn(process.execPath, [mcpPath], {
       stdio: ["pipe", "pipe", "ignore"],
       windowsHide: true,
+      env: cleanMcpEnv,
     });
     let stdout = "";
     const timer = setTimeout(() => {

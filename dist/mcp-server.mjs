@@ -2,651 +2,82 @@
 // agy-fast MCP Stdio Server (bundled zero-dependency ESM)
 
 
-// src/mcp-server.ts
-import fs6 from "node:fs";
-import os4 from "node:os";
-import path7 from "node:path";
-import { fileURLToPath as fileURLToPath2 } from "node:url";
+// src/tools/apply-edits.ts
+import { isUtf8 } from "node:buffer";
+import { promises as fs2 } from "node:fs";
+import path3 from "node:path";
 
-// src/protocol/mcp.ts
-import { fileURLToPath } from "node:url";
-var SUPPORTED_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
-  "2025-11-25",
-  "2025-06-18",
-  "2025-03-26",
-  "2024-11-05"
-]);
-var DEFAULT_PROTOCOL_VERSION = "2025-03-26";
-var ROOTS_REQUEST_TIMEOUT_MS = 1e3;
-var MAX_KNOWN_ROOTS_IDS = 64;
-var MAX_FRAME_BYTES = 64 * 1024 * 1024;
-var McpStdioServer = class {
-  tools = /* @__PURE__ */ new Map();
-  serverName;
-  serverVersion;
-  inFlight = 0;
-  stdinEnded = false;
-  onDrainExit;
-  onWorkspaceRoots;
-  shouldRequestRoots;
-  onInitialize;
-  sendToClient;
-  clientSupportsRoots = false;
-  rootsDirty = false;
-  rootsRequestCount = 0;
-  lastAppliedRootsSeq = 0;
-  pendingRoots = /* @__PURE__ */ new Map();
-  knownRootsIds = /* @__PURE__ */ new Map();
-  rootsWaiters = /* @__PURE__ */ new Set();
-  activeOutgoingQueue = null;
-  initWriteInFlight = 0;
-  postInitOutgoingQueue = [];
-  rootsTimeoutMs;
-  maxFrameBytes;
-  constructor(options) {
-    this.serverName = options.name;
-    this.serverVersion = options.version;
-    this.onWorkspaceRoots = options.onWorkspaceRoots;
-    this.shouldRequestRoots = options.shouldRequestRoots;
-    this.onInitialize = options.onInitialize;
-    this.rootsTimeoutMs = typeof options.rootsTimeoutMs === "number" && Number.isFinite(options.rootsTimeoutMs) && options.rootsTimeoutMs > 0 ? Math.trunc(options.rootsTimeoutMs) : ROOTS_REQUEST_TIMEOUT_MS;
-    this.maxFrameBytes = typeof options.maxFrameBytes === "number" && Number.isFinite(options.maxFrameBytes) && options.maxFrameBytes > 0 ? Math.trunc(options.maxFrameBytes) : MAX_FRAME_BYTES;
+// src/utils/arg-validation.ts
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function describeValueType(value) {
+  if (value === null) return "null";
+  if (value === void 0) return "undefined";
+  if (Array.isArray(value)) return `array (len=${value.length})`;
+  if (typeof value === "boolean") return `boolean (${String(value)})`;
+  if (typeof value === "number") return `number (${String(value)})`;
+  if (typeof value === "string") return `string (len=${value.length})`;
+  return typeof value;
+}
+function parseMaybeJsonArray(value) {
+  if (value === void 0) {
+    return { ok: false, kind: "missing", detail: "undefined" };
   }
-  flushRootsWaiters() {
-    for (const waiter of this.rootsWaiters) {
-      let stillWaiting = false;
-      for (const pending of this.pendingRoots.values()) {
-        if (pending.seq <= waiter.minSeq) {
-          stillWaiting = true;
-          break;
-        }
-      }
-      if (!stillWaiting) {
-        this.rootsWaiters.delete(waiter);
-        waiter.resolve();
-      }
-    }
+  if (Array.isArray(value)) {
+    return { ok: true, value };
   }
-  settleAllPendingRoots() {
-    for (const pending of this.pendingRoots.values()) {
-      clearTimeout(pending.timer);
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return { ok: false, kind: "wrong_type", detail: "empty string" };
     }
-    this.pendingRoots.clear();
-    for (const waiter of this.rootsWaiters) {
-      waiter.resolve();
-    }
-    this.rootsWaiters.clear();
-  }
-  waitForRoots() {
-    if (this.pendingRoots.size === 0 || this.stdinEnded) {
-      return Promise.resolve();
-    }
-    if (this.activeOutgoingQueue && this.activeOutgoingQueue.length > 0) {
-      const tasks = this.activeOutgoingQueue.splice(0, this.activeOutgoingQueue.length);
-      if (this.initWriteInFlight > 0) {
-        this.postInitOutgoingQueue.push(...tasks);
-      } else {
-        for (const task of tasks) {
-          try {
-            task();
-          } catch {
-          }
-        }
-      }
-    }
-    const minSeq = this.rootsRequestCount;
-    return new Promise((resolve) => {
-      this.rootsWaiters.add({ minSeq, resolve });
-    });
-  }
-  pruneKnownRootsIds() {
-    if (this.knownRootsIds.size <= MAX_KNOWN_ROOTS_IDS) return;
-    for (const key of this.knownRootsIds.keys()) {
-      if (this.knownRootsIds.size <= MAX_KNOWN_ROOTS_IDS) break;
-      if (!this.pendingRoots.has(key)) {
-        this.knownRootsIds.delete(key);
-      }
-    }
-  }
-  // Tool calls wait for the pending answer (bounded by rootsTimeoutMs and stdin EOF),
-  // so the first call already sees the workspace roots without ever deadlocking.
-  requestRoots(useContentLength) {
-    if (this.stdinEnded || !this.clientSupportsRoots || !this.onWorkspaceRoots || !this.sendToClient) {
-      return;
-    }
-    this.rootsRequestCount += 1;
-    const seq = this.rootsRequestCount;
-    const id = `agy-fast-roots-${seq}`;
-    const timer = setTimeout(() => {
-      if (this.pendingRoots.delete(id)) {
-        this.pruneKnownRootsIds();
-        this.flushRootsWaiters();
-      }
-    }, this.rootsTimeoutMs);
-    timer.unref();
-    this.pendingRoots.set(id, { seq, timer });
-    this.knownRootsIds.set(id, seq);
-    this.pruneKnownRootsIds();
-    const send = this.sendToClient;
-    const sendTask = () => {
-      if (this.stdinEnded) return;
-      send({ jsonrpc: "2.0", id, method: "roots/list" }, useContentLength);
-    };
-    if (this.activeOutgoingQueue) {
-      this.activeOutgoingQueue.push(sendTask);
-    } else {
-      sendTask();
-    }
-  }
-  receiveRoots(result) {
-    if (!result || typeof result !== "object") return;
-    const rawRoots = result.roots;
-    if (!Array.isArray(rawRoots)) return;
-    const paths = [];
-    for (const root of rawRoots) {
-      if (!root || typeof root !== "object") continue;
-      const uri = root.uri;
-      if (typeof uri !== "string" || !/^file:/i.test(uri)) continue;
-      try {
-        paths.push(fileURLToPath(uri));
-      } catch {
-      }
-    }
-    if (paths.length > 0) {
-      try {
-        this.onWorkspaceRoots?.(paths);
-      } catch {
-      }
-    }
-  }
-  registerTool(definition, handler) {
-    const name = typeof definition === "function" ? definition().name : definition.name;
-    this.tools.set(name, { definition, handler });
-  }
-  async handleMessage(raw, useContentLength = false) {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-      return {
-        jsonrpc: "2.0",
-        id: null,
-        error: { code: -32600, message: "Invalid Request" }
-      };
-    }
-    const msg = raw;
-    const hasId = Object.prototype.hasOwnProperty.call(msg, "id") && msg.id !== void 0;
-    const id = hasId ? msg.id ?? null : null;
-    const method = typeof msg.method === "string" ? msg.method : "";
-    if (!method && typeof id === "string" && this.knownRootsIds.has(id)) {
-      const seq = this.knownRootsIds.get(id);
-      this.knownRootsIds.delete(id);
-      const pending = this.pendingRoots.get(id);
-      if (pending) {
-        clearTimeout(pending.timer);
-        this.pendingRoots.delete(id);
-      }
-      const errField = msg.error;
-      const hasError = errField !== void 0 && errField !== null;
-      try {
-        if (!hasError && seq >= this.lastAppliedRootsSeq) {
-          this.lastAppliedRootsSeq = seq;
-          for (const [oldId, oldPending] of this.pendingRoots.entries()) {
-            if (oldPending.seq < seq) {
-              clearTimeout(oldPending.timer);
-              this.pendingRoots.delete(oldId);
-            }
-          }
-          this.receiveRoots(msg.result);
-        }
-      } finally {
-        this.pruneKnownRootsIds();
-        this.flushRootsWaiters();
-      }
-      return null;
-    }
-    if (!method) {
-      return {
-        jsonrpc: "2.0",
-        id,
-        error: { code: -32600, message: "Invalid Request: missing method" }
-      };
-    }
-    if (!hasId) {
-      if (method === "notifications/initialized" || method === "notifications/roots/list_changed") {
-        if (this.clientSupportsRoots) {
-          this.rootsDirty = true;
-        }
-      }
-      return null;
-    }
-    if (method === "initialize") {
-      const requested = typeof msg.params?.protocolVersion === "string" ? msg.params.protocolVersion.trim() : "";
-      const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : DEFAULT_PROTOCOL_VERSION;
-      const capabilities = msg.params?.capabilities;
-      this.clientSupportsRoots = capabilities?.roots !== null && typeof capabilities?.roots === "object" && !Array.isArray(capabilities?.roots);
-      this.rootsDirty = this.clientSupportsRoots;
-      const rawClientInfo = msg.params?.clientInfo;
-      let clientInfo;
-      if (rawClientInfo !== null && typeof rawClientInfo === "object" && !Array.isArray(rawClientInfo)) {
-        const ci = rawClientInfo;
-        clientInfo = {
-          name: typeof ci.name === "string" ? ci.name : void 0,
-          version: typeof ci.version === "string" ? ci.version : void 0
-        };
-      }
-      try {
-        this.onInitialize?.({ clientInfo, protocolVersion });
-      } catch {
-      }
-      return {
-        jsonrpc: "2.0",
-        id,
-        result: {
-          protocolVersion,
-          capabilities: {
-            tools: {}
-          },
-          serverInfo: {
-            name: this.serverName,
-            version: this.serverVersion
-          }
-        }
-      };
-    }
-    if (method === "ping") {
-      return { jsonrpc: "2.0", id, result: {} };
-    }
-    if (method === "tools/list") {
-      const definitions = [...this.tools.values()].map(
-        (t) => typeof t.definition === "function" ? t.definition() : t.definition
-      );
-      return { jsonrpc: "2.0", id, result: { tools: definitions } };
-    }
-    if (method === "resources/list") {
-      return { jsonrpc: "2.0", id, result: { resources: [] } };
-    }
-    if (method === "resources/templates/list") {
-      return { jsonrpc: "2.0", id, result: { resourceTemplates: [] } };
-    }
-    if (method === "prompts/list") {
-      return { jsonrpc: "2.0", id, result: { prompts: [] } };
-    }
-    if (method === "tools/call") {
-      const name = typeof msg.params?.name === "string" ? msg.params.name : "";
-      const tool = this.tools.get(name);
-      if (!tool) {
-        return {
-          jsonrpc: "2.0",
-          id,
-          error: { code: -32602, message: `Unknown tool: ${name}` }
-        };
-      }
-      const rawArgs = msg.params?.arguments;
-      let args;
-      if (rawArgs === void 0 || rawArgs === null) {
-        args = {};
-      } else if (typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
-        args = rawArgs;
-      } else if (typeof rawArgs === "string" && rawArgs.trim().startsWith("{")) {
-        try {
-          const parsedArgs = JSON.parse(rawArgs);
-          if (parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)) {
-            args = parsedArgs;
-          } else {
-            return {
-              jsonrpc: "2.0",
-              id,
-              error: {
-                code: -32602,
-                message: `Invalid params: 'arguments' for '${name}' must be a JSON object`
-              }
-            };
-          }
-        } catch {
-          return {
-            jsonrpc: "2.0",
-            id,
-            error: {
-              code: -32602,
-              message: `Invalid params: malformed JSON string in 'arguments' for '${name}'`
-            }
-          };
-        }
-      } else {
-        return {
-          jsonrpc: "2.0",
-          id,
-          error: {
-            code: -32602,
-            message: `Invalid params: 'arguments' for '${name}' must be an object (received ${Array.isArray(rawArgs) ? "array" : typeof rawArgs})`
-          }
-        };
-      }
-      try {
-        const needRoots = this.clientSupportsRoots && Boolean(this.onWorkspaceRoots) && (this.shouldRequestRoots ? this.shouldRequestRoots(name, args) : true);
-        if (needRoots) {
-          if (this.rootsDirty && !this.stdinEnded) {
-            this.rootsDirty = false;
-            this.requestRoots(useContentLength);
-          }
-          await this.waitForRoots();
-        }
-        const res = await tool.handler(args);
-        return {
-          jsonrpc: "2.0",
-          id,
-          result: {
-            content: [{ type: "text", text: res.text }],
-            isError: Boolean(res.isError)
-          }
-        };
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return {
-          jsonrpc: "2.0",
-          id,
-          result: {
-            content: [{ type: "text", text: `Tool error: ${message}` }],
-            isError: true
-          }
-        };
-      }
-    }
-    return {
-      jsonrpc: "2.0",
-      id,
-      error: { code: -32601, message: `Method not found: ${method}` }
-    };
-  }
-  listen(input = process.stdin, output = process.stdout, onExit) {
-    this.onDrainExit = onExit;
-    const maxFrameBytes = this.maxFrameBytes;
-    let buffer = Buffer.alloc(0);
-    let discardingOversizedLine = false;
-    const writeResponse = (payload, useContentLength) => {
-      const serialized = JSON.stringify(payload);
-      if (useContentLength) {
-        const len = Buffer.byteLength(serialized, "utf8");
-        output.write(`Content-Length: ${len}\r
-\r
-${serialized}`);
-      } else {
-        output.write(`${serialized}
-`);
-      }
-    };
-    this.sendToClient = (request, useContentLength) => writeResponse(request, useContentLength);
-    let drainExitCalled = false;
-    const triggerDrainExit = () => {
-      if (drainExitCalled) return;
-      drainExitCalled = true;
-      this.onDrainExit?.();
-    };
-    const dispatchRawJson = (jsonText, useContentLength) => {
-      let parsed;
-      try {
-        parsed = JSON.parse(jsonText);
-      } catch {
-        writeResponse(
-          {
-            jsonrpc: "2.0",
-            id: null,
-            error: { code: -32700, message: "Parse error" }
-          },
-          useContentLength
-        );
-        return;
-      }
-      this.inFlight += 1;
-      const finish = () => {
-        this.inFlight -= 1;
-        if (this.stdinEnded && this.inFlight === 0) {
-          triggerDrainExit();
-        }
-      };
-      const outgoingForCall = [];
-      const flushOutgoingForCall = () => {
-        for (const task of outgoingForCall) {
-          task();
-        }
-      };
+    try {
+      const parsed = JSON.parse(trimmed);
       if (Array.isArray(parsed)) {
-        if (parsed.length === 0) {
-          writeResponse(
-            {
-              jsonrpc: "2.0",
-              id: null,
-              error: { code: -32600, message: "Invalid Request: empty batch" }
-            },
-            useContentLength
-          );
-          finish();
-          return;
-        }
-        const prevQueue2 = this.activeOutgoingQueue;
-        this.activeOutgoingQueue = outgoingForCall;
-        let promises;
-        try {
-          promises = parsed.map((item) => this.handleMessage(item, useContentLength));
-        } finally {
-          this.activeOutgoingQueue = prevQueue2;
-        }
-        const isInitOnlyBatch = parsed.some(
-          (item) => item !== null && typeof item === "object" && item.method === "initialize"
-        ) && !parsed.some(
-          (item) => item !== null && typeof item === "object" && item.method === "tools/call"
-        );
-        if (isInitOnlyBatch) {
-          this.initWriteInFlight += 1;
-        }
-        const releaseInitFlush = () => {
-          if (!isInitOnlyBatch) return;
-          this.initWriteInFlight = Math.max(0, this.initWriteInFlight - 1);
-          if (this.initWriteInFlight === 0 && this.postInitOutgoingQueue.length > 0) {
-            const queued = this.postInitOutgoingQueue.splice(0, this.postInitOutgoingQueue.length);
-            for (const task of queued) {
-              try {
-                task();
-              } catch {
-              }
-            }
-          }
+        return { ok: true, value: parsed };
+      }
+      if (parsed === null || typeof parsed === "boolean") {
+        return {
+          ok: false,
+          kind: "corrupted_literal",
+          detail: describeValueType(parsed),
+          value: parsed
         };
-        void Promise.all(promises).then((responses) => {
-          const nonNull = responses.filter(
-            (r) => r !== null
-          );
-          if (nonNull.length > 0) {
-            writeResponse(nonNull, useContentLength);
-          }
-          flushOutgoingForCall();
-          releaseInitFlush();
-        }).catch(() => {
-          releaseInitFlush();
-        }).finally(finish);
-        return;
       }
-      const isSingleInit = parsed !== null && typeof parsed === "object" && parsed.method === "initialize";
-      if (isSingleInit) {
-        this.initWriteInFlight += 1;
-      }
-      const releaseSingleInitFlush = () => {
-        if (!isSingleInit) return;
-        this.initWriteInFlight = Math.max(0, this.initWriteInFlight - 1);
-        if (this.initWriteInFlight === 0 && this.postInitOutgoingQueue.length > 0) {
-          const queued = this.postInitOutgoingQueue.splice(0, this.postInitOutgoingQueue.length);
-          for (const task of queued) {
-            try {
-              task();
-            } catch {
-            }
-          }
-        }
+      return {
+        ok: false,
+        kind: "invalid_json",
+        detail: `decoded to ${describeValueType(parsed)} instead of a JSON array`
       };
-      const prevQueue = this.activeOutgoingQueue;
-      this.activeOutgoingQueue = outgoingForCall;
-      let promise;
-      try {
-        promise = this.handleMessage(parsed, useContentLength);
-      } finally {
-        this.activeOutgoingQueue = prevQueue;
-      }
-      void promise.then((response) => {
-        if (response !== null) {
-          writeResponse(response, useContentLength);
-        }
-        flushOutgoingForCall();
-        releaseSingleInitFlush();
-      }).catch(() => {
-        releaseSingleInitFlush();
-      }).finally(finish);
-    };
-    const drainBuffer = () => {
-      while (buffer.length > 0) {
-        if (discardingOversizedLine) {
-          const nlIdx = buffer.indexOf(10);
-          if (nlIdx === -1) {
-            buffer = Buffer.alloc(0);
-            break;
-          }
-          discardingOversizedLine = false;
-          buffer = nlIdx + 1 >= buffer.length ? Buffer.alloc(0) : Buffer.from(buffer.subarray(nlIdx + 1));
-          continue;
-        }
-        let offset = 0;
-        while (offset < buffer.length && (buffer[offset] === 10 || buffer[offset] === 13)) {
-          offset++;
-        }
-        if (offset > 0) {
-          buffer = buffer.subarray(offset);
-          if (buffer.length === 0) break;
-        }
-        const headerProbe = buffer.subarray(0, 16).toString("latin1").toLowerCase();
-        if (headerProbe.startsWith("content-length:") || headerProbe.startsWith("content-type:")) {
-          const headerScan = buffer.subarray(0, Math.min(buffer.length, 16384)).toString("latin1");
-          const sepMatch = /\r?\n\r?\n/.exec(headerScan);
-          if (!sepMatch) {
-            if (buffer.length >= 16384) {
-              writeResponse(
-                {
-                  jsonrpc: "2.0",
-                  id: null,
-                  error: { code: -32600, message: "Invalid Request: header too large" }
-                },
-                true
-              );
-              buffer = Buffer.alloc(0);
-            }
-            break;
-          }
-          const sepIdx = sepMatch.index;
-          const sepLen = sepMatch[0].length;
-          const headerText = headerScan.slice(0, sepIdx);
-          const clMatches = [...headerText.matchAll(/^content-length:[ \t]*(\d+)[ \t]*\r?$/gim)];
-          if (clMatches.length !== 1) {
-            writeResponse(
-              {
-                jsonrpc: "2.0",
-                id: null,
-                error: { code: -32600, message: "Invalid Request: invalid Content-Length header" }
-              },
-              true
-            );
-            buffer = buffer.subarray(sepIdx + sepLen);
-            continue;
-          }
-          const contentLength = Number(clMatches[0][1]);
-          if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > maxFrameBytes) {
-            writeResponse(
-              {
-                jsonrpc: "2.0",
-                id: null,
-                error: { code: -32600, message: "Invalid Request: Content-Length out of bounds" }
-              },
-              true
-            );
-            buffer = Buffer.alloc(0);
-            break;
-          }
-          const bodyStart = sepIdx + sepLen;
-          if (buffer.length < bodyStart + contentLength) {
-            break;
-          }
-          const bodyText = buffer.subarray(bodyStart, bodyStart + contentLength).toString("utf8");
-          buffer = buffer.subarray(bodyStart + contentLength);
-          dispatchRawJson(bodyText, true);
-          continue;
-        }
-        const newlineIdx = buffer.indexOf(10);
-        if (newlineIdx === -1) {
-          const pendingLen = buffer.length > 0 && buffer[buffer.length - 1] === 13 ? buffer.length - 1 : buffer.length;
-          if (pendingLen > maxFrameBytes) {
-            writeResponse(
-              {
-                jsonrpc: "2.0",
-                id: null,
-                error: {
-                  code: -32600,
-                  message: "Invalid Request: NDJSON message exceeds maximum allowed size"
-                }
-              },
-              false
-            );
-            discardingOversizedLine = true;
-            buffer = Buffer.alloc(0);
-          }
-          break;
-        }
-        const lineLen = newlineIdx > 0 && buffer[newlineIdx - 1] === 13 ? newlineIdx - 1 : newlineIdx;
-        if (lineLen > maxFrameBytes) {
-          writeResponse(
-            {
-              jsonrpc: "2.0",
-              id: null,
-              error: {
-                code: -32600,
-                message: "Invalid Request: NDJSON message exceeds maximum allowed size"
-              }
-            },
-            false
-          );
-          buffer = newlineIdx + 1 >= buffer.length ? Buffer.alloc(0) : Buffer.from(buffer.subarray(newlineIdx + 1));
-          continue;
-        }
-        const lineBuf = buffer.subarray(0, newlineIdx);
-        buffer = buffer.subarray(newlineIdx + 1);
-        const line = lineBuf.toString("utf8").trim();
-        if (line.length > 0) {
-          dispatchRawJson(line, false);
-        }
-      }
-    };
-    input.on("data", (chunk) => {
-      const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
-      buffer = buffer.length === 0 ? buf : Buffer.concat([buffer, buf]);
-      drainBuffer();
-    });
-    const handleInputClosed = (flushTrailing) => {
-      if (this.stdinEnded) return;
-      const wasDiscarding = discardingOversizedLine;
-      discardingOversizedLine = false;
-      const remaining = flushTrailing && !wasDiscarding ? buffer.toString("utf8").trim() : "";
-      buffer = Buffer.alloc(0);
-      this.stdinEnded = true;
-      if (flushTrailing && remaining.length > 0) {
-        const lowerRem = remaining.toLowerCase();
-        if (!lowerRem.startsWith("content-length:") && !lowerRem.startsWith("content-type:")) {
-          dispatchRawJson(remaining, false);
-        }
-      }
-      this.settleAllPendingRoots();
-      if (this.inFlight === 0) {
-        triggerDrainExit();
-      }
-    };
-    input.on("end", () => handleInputClosed(true));
-    input.on("close", () => handleInputClosed(false));
-    input.on("error", () => handleInputClosed(false));
+    } catch (err) {
+      return {
+        ok: false,
+        kind: "invalid_json",
+        detail: err instanceof Error ? err.message : String(err)
+      };
+    }
   }
-};
+  return {
+    ok: false,
+    kind: "wrong_type",
+    detail: describeValueType(value)
+  };
+}
+function formatCorruptedArrayError(options) {
+  const details = options.items.slice(0, 8).map(
+    (item) => `- ${item.label}: received ${describeValueType(item.value)} instead of ${item.expected ?? "an object"}`
+  );
+  if (options.items.length > 8) {
+    details.push(`- ... (+${options.items.length - 8} more corrupted entries)`);
+  }
+  return [
+    `${options.header}: nested argument serialization corruption detected in call_mcp_tool.`,
+    ...details,
+    "",
+    `Hint: untyped call_mcp_tool Arguments can occasionally collapse nested objects/arrays into booleans, null, or an empty array. Do NOT retry the same ${options.toolName} payload \u2014 ${options.fallbackAdvice}`
+  ].join("\n");
+}
 
 // src/utils/exec-utils.ts
 import { spawn, spawnSync } from "node:child_process";
@@ -1389,10 +820,369 @@ async function isRipgrepAvailable() {
   return probe;
 }
 
-// src/utils/host-compat.ts
-import fs from "node:fs";
+// src/utils/fs-utils.ts
+import { promises as fs } from "node:fs";
 import os2 from "node:os";
 import path2 from "node:path";
+var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
+  ".git",
+  ".hg",
+  ".svn",
+  "node_modules",
+  "dist",
+  "build",
+  "out",
+  "target",
+  ".next",
+  ".nuxt",
+  ".svelte-kit",
+  ".cache",
+  ".turbo",
+  "coverage",
+  "__pycache__",
+  ".venv",
+  "venv",
+  ".tox",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".gradle",
+  ".idea",
+  "vendor"
+]);
+function expandHome(inputPath) {
+  if (inputPath === "~") return os2.homedir();
+  if (inputPath.startsWith("~/") || inputPath.startsWith("~\\")) {
+    return path2.join(os2.homedir(), inputPath.slice(2));
+  }
+  return inputPath;
+}
+function resolvePath(inputPath, baseDir) {
+  const expanded = expandHome(inputPath.trim());
+  const root = baseDir ? path2.resolve(expandHome(baseDir)) : process.cwd();
+  return path2.resolve(root, expanded);
+}
+function toPosixPath(p) {
+  return p.split(path2.sep).join("/");
+}
+function isLikelyBinary(buf) {
+  const limit = Math.min(buf.length, 8192);
+  for (let i = 0; i < limit; i++) {
+    if (buf[i] === 0) return true;
+  }
+  return false;
+}
+function hasUtf8Bom(buf) {
+  return buf.length >= 3 && buf[0] === 239 && buf[1] === 187 && buf[2] === 191;
+}
+function detectUtf16Bom(buf) {
+  if (buf.length < 2) return null;
+  if (buf[0] === 255 && buf[1] === 254) {
+    if (buf.length >= 4 && buf[2] === 0 && buf[3] === 0) {
+      return null;
+    }
+    return "UTF-16 LE";
+  }
+  if (buf[0] === 254 && buf[1] === 255) {
+    return "UTF-16 BE";
+  }
+  return null;
+}
+async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
+  const stat = await fs.stat(filePath);
+  if (!stat.isFile()) {
+    throw new Error(`Not a regular file: ${filePath}`);
+  }
+  if (stat.size > maxBytes) {
+    throw new Error(
+      `File exceeds maximum size (${stat.size} bytes > ${maxBytes} bytes): ${filePath}`
+    );
+  }
+  const buf = await fs.readFile(filePath);
+  const utf16Bom = detectUtf16Bom(buf);
+  if (utf16Bom) {
+    throw new Error(
+      `UTF-16 encoded file is not supported (convert to UTF-8 first): ${filePath} [${utf16Bom}]`
+    );
+  }
+  if (isLikelyBinary(buf)) {
+    throw new Error(`Binary file cannot be read as text: ${filePath}`);
+  }
+  const hasBom = hasUtf8Bom(buf);
+  const rawContent = (hasBom ? buf.subarray(3) : buf).toString("utf8");
+  let crlfCount = 0;
+  let lfOnlyCount = 0;
+  for (let i = 0; i < rawContent.length; i++) {
+    if (rawContent[i] === "\n") {
+      if (i > 0 && rawContent[i - 1] === "\r") crlfCount++;
+      else lfOnlyCount++;
+    }
+  }
+  const eol = crlfCount > lfOnlyCount ? "\r\n" : "\n";
+  const mixedEol = crlfCount > 0 && lfOnlyCount > 0;
+  return {
+    content: rawContent,
+    rawContent,
+    eol,
+    mixedEol,
+    hasBom,
+    size: stat.size,
+    mode: stat.mode & 4095,
+    rawBuffer: buf
+  };
+}
+function globToRegExp(pattern) {
+  const normalized = pattern.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\*{3,}/g, "**").replace(/(?:\*\*\/)+/g, "**/");
+  const re = `^${compileGlobBody(normalized)}$`;
+  try {
+    return new RegExp(re);
+  } catch (err) {
+    throw new Error(
+      `Invalid glob pattern '${pattern}': ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+function compileGlobBody(normalized) {
+  let re = "";
+  let i = 0;
+  while (i < normalized.length) {
+    const ch = normalized[i];
+    if (ch === "*") {
+      if (normalized[i + 1] === "*") {
+        if (normalized[i + 2] === "/") {
+          re += "(?:.*/)?";
+          i += 3;
+        } else {
+          re += ".*";
+          i += 2;
+        }
+      } else {
+        re += "[^/]*";
+        i += 1;
+      }
+    } else if (ch === "?") {
+      re += "[^/]";
+      i += 1;
+    } else if (ch === "[") {
+      const close = findClosingBracket(normalized, i);
+      if (close === -1) {
+        re += "\\[";
+        i += 1;
+      } else {
+        let inner = normalized.slice(i + 1, close);
+        const negated = inner.startsWith("!") || inner.startsWith("^");
+        if (negated) inner = inner.slice(1);
+        inner = inner.replace(/\\/g, "\\\\").replace(/\]/g, "\\]");
+        re += negated ? `(?!/)[${"^"}${inner}]` : `[${inner}]`;
+        i = close + 1;
+      }
+    } else if (ch === "{") {
+      const close = findMatchingBrace(normalized, i);
+      if (close === -1) {
+        re += "\\{";
+        i += 1;
+      } else {
+        const parts = splitBraceAlternatives(normalized.slice(i + 1, close));
+        const sub = parts.map((part) => compileGlobBody(part.replace(/\*{3,}/g, "**").replace(/(?:\*\*\/)+/g, "**/"))).join("|");
+        re += `(?:${sub})`;
+        i = close + 1;
+      }
+    } else if (".+^$()|\\".includes(ch)) {
+      re += "\\" + ch;
+      i += 1;
+    } else {
+      re += ch;
+      i += 1;
+    }
+  }
+  return re;
+}
+function findClosingBracket(str, openIdx) {
+  let i = openIdx + 1;
+  if (i < str.length && (str[i] === "!" || str[i] === "^")) i++;
+  if (i < str.length && str[i] === "]") i++;
+  for (; i < str.length; i++) {
+    if (str[i] === "]") return i;
+  }
+  return -1;
+}
+function findMatchingBrace(str, openIdx) {
+  let depth = 0;
+  for (let i = openIdx; i < str.length; i++) {
+    if (str[i] === "[") {
+      const close = findClosingBracket(str, i);
+      if (close !== -1) {
+        i = close;
+        continue;
+      }
+    }
+    if (str[i] === "{") depth++;
+    else if (str[i] === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+function splitBraceAlternatives(inner) {
+  const parts = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (ch === "[") {
+      const close = findClosingBracket(inner, i);
+      if (close !== -1) {
+        i = close;
+        continue;
+      }
+    }
+    if (ch === "{") depth++;
+    else if (ch === "}") depth--;
+    else if (ch === "," && depth === 0) {
+      parts.push(inner.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(inner.slice(start));
+  return parts;
+}
+async function walkFiles(rootDir, options = {}) {
+  const maxFiles = Math.max(0, Math.trunc(options.maxFiles ?? 5e3));
+  const maxDepth = options.maxDepth ?? 32;
+  const includeHidden = options.includeHidden ?? false;
+  const ignoreDirs = options.ignoreDirs ?? DEFAULT_IGNORE_DIRS;
+  const fileFilter = options.fileFilter;
+  const timeoutMs = options.timeoutMs !== void 0 && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Math.max(1, Math.trunc(options.timeoutMs)) : null;
+  const deadline = timeoutMs !== null ? Date.now() + timeoutMs : null;
+  const maxDirs = options.maxDirs !== void 0 && Number.isFinite(options.maxDirs) && options.maxDirs > 0 ? Math.max(1, Math.trunc(options.maxDirs)) : null;
+  const files = [];
+  let truncated = false;
+  let timedOut = false;
+  let dirsTruncated = false;
+  let visitedDirs = 0;
+  const MAX_CONCURRENT_READDIRS = 16;
+  let activeReaddirs = 0;
+  const waitQueue = [];
+  const drainWaiters = () => {
+    while (waitQueue.length > 0) {
+      waitQueue.shift()();
+    }
+  };
+  const markTruncated = () => {
+    if (truncated) return;
+    truncated = true;
+    drainWaiters();
+  };
+  const withinBudget = () => {
+    if (truncated) return false;
+    if (deadline !== null && Date.now() >= deadline) {
+      timedOut = true;
+      markTruncated();
+      return false;
+    }
+    return true;
+  };
+  const timeoutTimer = timeoutMs !== null ? setTimeout(() => {
+    timedOut = true;
+    markTruncated();
+  }, timeoutMs) : null;
+  timeoutTimer?.unref();
+  const readDirBounded = async (dir) => {
+    if (!withinBudget()) return null;
+    while (activeReaddirs >= MAX_CONCURRENT_READDIRS) {
+      await new Promise((resolve) => waitQueue.push(resolve));
+      if (!withinBudget()) return null;
+    }
+    if (!withinBudget()) return null;
+    if (maxDirs !== null && visitedDirs >= maxDirs) {
+      dirsTruncated = true;
+      markTruncated();
+      return null;
+    }
+    visitedDirs++;
+    activeReaddirs++;
+    try {
+      return await fs.readdir(dir, { withFileTypes: true });
+    } finally {
+      activeReaddirs--;
+      if (truncated) {
+        drainWaiters();
+      } else {
+        const next = waitQueue.shift();
+        if (next) next();
+      }
+    }
+  };
+  const scanDir = async (dir, relDir) => {
+    if (!withinBudget()) return { localFiles: [], subdirs: [] };
+    let entries;
+    try {
+      entries = await readDirBounded(dir);
+    } catch {
+      return { localFiles: [], subdirs: [] };
+    }
+    if (!entries || !withinBudget()) return { localFiles: [], subdirs: [] };
+    entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    const localFiles = [];
+    const subdirs = [];
+    for (const entry of entries) {
+      const name = entry.name;
+      if (!includeHidden && name.startsWith(".")) {
+        if (!(entry.isDirectory() && name === ".agents")) {
+          continue;
+        }
+      }
+      const relPosix = relDir ? `${relDir}/${name}` : name;
+      if (entry.isDirectory()) {
+        if (ignoreDirs.has(name)) continue;
+        subdirs.push({ abs: path2.join(dir, name), rel: relPosix });
+      } else if (entry.isFile()) {
+        if (fileFilter && !fileFilter(relPosix)) continue;
+        localFiles.push(relPosix);
+      }
+    }
+    return { localFiles, subdirs };
+  };
+  async function visit(dir, relDir, depth, prefetched) {
+    if (!withinBudget() || depth > maxDepth) return;
+    const { localFiles, subdirs } = await (prefetched ?? scanDir(dir, relDir));
+    if (!withinBudget()) return;
+    for (const relPosix of localFiles) {
+      if (files.length >= maxFiles) {
+        markTruncated();
+        return;
+      }
+      files.push(relPosix);
+    }
+    if (depth >= maxDepth || subdirs.length === 0) return;
+    const batchSize = 8;
+    for (let i = 0; i < subdirs.length && withinBudget(); i += batchSize) {
+      const slice = subdirs.slice(i, i + batchSize);
+      const prefetches = slice.map((sub) => scanDir(sub.abs, sub.rel));
+      try {
+        for (let j = 0; j < slice.length && withinBudget(); j++) {
+          await visit(slice[j].abs, slice[j].rel, depth + 1, prefetches[j]);
+        }
+      } finally {
+        if (truncated) {
+          await Promise.allSettled(prefetches);
+        }
+      }
+    }
+  }
+  try {
+    await visit(rootDir, "", 0);
+  } finally {
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+  }
+  return {
+    files,
+    truncated,
+    ...timedOut ? { timedOut: true } : {},
+    ...dirsTruncated ? { dirsTruncated: true } : {}
+  };
+}
 
 // src/utils/output-filter.ts
 var ANSI_REGEX = (
@@ -2341,730 +2131,6 @@ function getTailLines(text, count) {
   return lines.slice(-count).join("\n");
 }
 
-// src/utils/host-compat.ts
-var HOST_COMPAT_RULES = [
-  {
-    id: "agy-cli-1.5-call-mcp-tool-empty-edits",
-    surface: "cli",
-    minVersion: "1.5.0",
-    // Antigravity CLI >= 1.5.8 supports `"eager": true` in mcp_config.json,
-    // which registers typed native mcp_agy-fast_fast_* tools and bypasses
-    // lazy call_mcp_tool altogether (keeping token-saving native array edits).
-    // Pre-eager CLI 1.5.0-1.5.7 keeps the JSON-string workaround automatically;
-    // any lazy/custom setup can still opt in via AGY_FAST_EDITS_FORMAT=string.
-    maxVersionExclusive: "1.5.8",
-    editsFormat: "string",
-    reason: "Pre-eager Antigravity CLI 1.5.0-1.5.7 loads tools lazily via call_mcp_tool where long native edits arrays can drop to []; JSON array string avoids payload loss"
-  }
-];
-function parseHostSemverParts(raw) {
-  const m = /(?:^|[^0-9.])v?(\d+)\.(\d+)\.(\d+)(?:\.\d+)?(?:-([0-9A-Za-z.-]+))?(?:$|[^0-9.])/.exec(
-    raw.trim()
-  );
-  if (!m) return null;
-  const major = Number.parseInt(m[1], 10);
-  const minor = Number.parseInt(m[2], 10);
-  const patch = Number.parseInt(m[3], 10);
-  if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor) || !Number.isSafeInteger(patch) || major > 999999 || minor > 999999 || patch > 999999) {
-    return null;
-  }
-  return { major, minor, patch, prerelease: m[4] ?? null };
-}
-function formatHostSemverParts(parts) {
-  const base = `${parts.major}.${parts.minor}.${parts.patch}`;
-  return parts.prerelease ? `${base}-${parts.prerelease}` : base;
-}
-function comparePrerelease(a, b) {
-  const aParts = a.split(".");
-  const bParts = b.split(".");
-  const len = Math.max(aParts.length, bParts.length);
-  for (let i = 0; i < len; i++) {
-    const ai = aParts[i];
-    const bi = bParts[i];
-    if (ai === void 0) return -1;
-    if (bi === void 0) return 1;
-    if (ai === bi) continue;
-    const aNum = /^\d+$/.test(ai);
-    const bNum = /^\d+$/.test(bi);
-    if (aNum && bNum) {
-      const diff = Number.parseInt(ai, 10) - Number.parseInt(bi, 10);
-      if (diff !== 0) return diff > 0 ? 1 : -1;
-    } else if (aNum !== bNum) {
-      return aNum ? -1 : 1;
-    } else {
-      return ai < bi ? -1 : 1;
-    }
-  }
-  return 0;
-}
-function compareHostSemver(a, b) {
-  const pa = parseHostSemverParts(a);
-  const pb = parseHostSemverParts(b);
-  if (!pa || !pb) return a.localeCompare(b);
-  if (pa.major !== pb.major) return pa.major > pb.major ? 1 : -1;
-  if (pa.minor !== pb.minor) return pa.minor > pb.minor ? 1 : -1;
-  if (pa.patch !== pb.patch) return pa.patch > pb.patch ? 1 : -1;
-  if (pa.prerelease === pb.prerelease) return 0;
-  if (pa.prerelease === null) return 1;
-  if (pb.prerelease === null) return -1;
-  return comparePrerelease(pa.prerelease, pb.prerelease);
-}
-function parseEditsFormatMode(raw) {
-  if (typeof raw !== "string") return null;
-  const v = raw.trim().toLowerCase();
-  if (v === "auto" || v === "array" || v === "string") return v;
-  return null;
-}
-function parseHostOverride(raw) {
-  if (typeof raw !== "string") return null;
-  const trimmed = raw.trim().toLowerCase();
-  if (!trimmed) return null;
-  const m = /^(cli|desktop|app|antigravity|ide|unknown)(?:[@\-/\s](.+))?$/.exec(trimmed);
-  if (!m) return null;
-  const surface = m[1] === "app" || m[1] === "antigravity" ? "desktop" : m[1];
-  if (m[2] !== void 0) {
-    const parts = parseHostSemverParts(m[2]);
-    if (!parts) return null;
-    return { surface, version: formatHostSemverParts(parts) };
-  }
-  return { surface, version: null };
-}
-var EXPLICIT_THIRD_PARTY_CLIENT_RE = /^(?:claude(?:[-_\s]|$)|cursor(?:[-_\s]|$)|windsurf(?:[-_\s]|$)|vscode(?:[-_\s]|$)|visual[\s_-]+studio[\s_-]+code|codex(?:[-_\s]|$)|zed(?:[-_\s]|$)|cline(?:[-_\s]|$)|roo[-_\s]?code|continue(?:[-_\s]|$)|opencode(?:[-_\s]|$)|aider(?:[-_\s]|$)|goose(?:[-_\s]|$)|jetbrains(?:[-_\s]|$)|neovim(?:[-_\s]|$)|nvim(?:[-_\s]|$)|emacs(?:[-_\s]|$)|mcp[-_\s]?inspector(?:[-_\s]|$))/i;
-function isExplicitThirdPartyClient(rawName) {
-  if (typeof rawName !== "string") return false;
-  return EXPLICIT_THIRD_PARTY_CLIENT_RE.test(rawName.trim());
-}
-function parseSurfaceFromClientName(rawName) {
-  if (typeof rawName !== "string") return null;
-  const s = rawName.trim().toLowerCase();
-  if (!s || s.startsWith("agy-fast")) return null;
-  if (/^(?:google[-_\s]?)?antigravity[-_\s]?cli$/.test(s) || /^agy(?:[-_\s]?cli)?$/.test(s)) {
-    return "cli";
-  }
-  if (/^(?:google[-_\s]?)?antigravity[-_\s]?ide$/.test(s)) {
-    return "ide";
-  }
-  if (/^(?:google[-_\s]?)?antigravity(?:[-_\s]?(?:2\.0|app|desktop))?$/.test(s)) {
-    return "desktop";
-  }
-  return null;
-}
-function parseLsVersion(raw) {
-  if (typeof raw !== "string") return null;
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  const parts = parseHostSemverParts(trimmed);
-  const version = parts ? formatHostSemverParts(parts) : null;
-  if (/^(?:antigravity[-_\s]?)?cli(?:[-_/@\s]|$)/i.test(trimmed)) {
-    return { surface: "cli", version };
-  }
-  if (/^(?:antigravity[-_\s]?)?ide(?:[-_/@\s]|$)/i.test(trimmed)) {
-    return { surface: "ide", version };
-  }
-  if (/^(?:antigravity[-_\s]?)?(?:desktop|app)(?:[-_/@\s]|$)/i.test(trimmed)) {
-    return { surface: "desktop", version };
-  }
-  if (/^antigravity(?:[-_/@\s]|$)/i.test(trimmed)) {
-    return { surface: "desktop", version };
-  }
-  if (version) {
-    return { surface: null, version };
-  }
-  return null;
-}
-function parseSurfaceFromPath(rawPath, allowTrailingAppDir = false) {
-  if (typeof rawPath !== "string" || !rawPath.trim()) return null;
-  const segs = rawPath.trim().replace(/\\/g, "/").split("/").filter(Boolean).map((s) => s.toLowerCase());
-  for (let i = 0; i < segs.length - 1; i++) {
-    if (segs[i] !== ".gemini") continue;
-    const next = segs[i + 1];
-    if (next === "antigravity-cli") return "cli";
-    if (next === "antigravity-ide") return "ide";
-    if (next === "antigravity") return "desktop";
-  }
-  if (allowTrailingAppDir && segs.length > 0) {
-    const tail = segs[segs.length - 1];
-    if (tail === "antigravity-cli") return "cli";
-    if (tail === "antigravity-ide") return "ide";
-    if (tail === "antigravity") return "desktop";
-  }
-  return null;
-}
-function detectHostIdentity(signals = {}) {
-  const env = signals.env ?? process.env;
-  const rawClientName = typeof signals.clientInfo?.name === "string" && signals.clientInfo.name.trim() ? signals.clientInfo.name.trim() : void 0;
-  const rawClientVersion = typeof signals.clientInfo?.version === "string" && signals.clientInfo.version.trim() ? signals.clientInfo.version.trim() : void 0;
-  const modelName = typeof signals.modelName === "string" && signals.modelName.trim() ? signals.modelName.trim() : void 0;
-  const override = parseHostOverride(env.AGY_FAST_HOST);
-  if (override) {
-    return {
-      surface: override.surface,
-      version: override.version,
-      source: "override",
-      rawClientName,
-      rawClientVersion,
-      modelName
-    };
-  }
-  if (isExplicitThirdPartyClient(rawClientName)) {
-    return {
-      surface: "unknown",
-      version: null,
-      source: "mcp:client-info",
-      rawClientName,
-      rawClientVersion,
-      modelName
-    };
-  }
-  const clientSurface = parseSurfaceFromClientName(rawClientName);
-  const clientVerParts = clientSurface && rawClientVersion ? parseHostSemverParts(rawClientVersion) : null;
-  const clientVersion = clientVerParts ? formatHostSemverParts(clientVerParts) : null;
-  const hookSurface = parseSurfaceFromPath(signals.transcriptPath) ?? parseSurfaceFromPath(signals.artifactDirectoryPath);
-  const lsInfo = parseLsVersion(env.ANTIGRAVITY_LS_VERSION);
-  const appDataSurface = parseSurfaceFromPath(env.ANTIGRAVITY_APP_DATA_DIR, true);
-  let surface = "unknown";
-  let source = "unknown";
-  if (clientSurface) {
-    surface = clientSurface;
-    source = "mcp:client-info";
-  } else if (hookSurface) {
-    surface = hookSurface;
-    source = "hook:path";
-  } else if (lsInfo?.surface) {
-    surface = lsInfo.surface;
-    source = "env:ls-version";
-  } else if (appDataSurface) {
-    surface = appDataSurface;
-    source = "env:app-data-dir";
-  }
-  let version = null;
-  if (clientSurface === surface && clientVersion) {
-    version = clientVersion;
-  } else if (surface !== "unknown" && lsInfo?.version && (lsInfo.surface === null || lsInfo.surface === surface)) {
-    version = lsInfo.version;
-  }
-  return {
-    surface,
-    version,
-    source,
-    rawClientName,
-    rawClientVersion,
-    modelName
-  };
-}
-function ruleMatchesIdentity(rule, identity) {
-  if (rule.surface !== identity.surface) return false;
-  if (rule.minVersion !== void 0 || rule.maxVersionExclusive !== void 0) {
-    if (!identity.version) return false;
-    if (rule.minVersion !== void 0 && compareHostSemver(identity.version, rule.minVersion) < 0) {
-      return false;
-    }
-    if (rule.maxVersionExclusive !== void 0 && compareHostSemver(identity.version, rule.maxVersionExclusive) >= 0) {
-      return false;
-    }
-  }
-  return true;
-}
-function resolveHostCompat(signals = {}, rules = HOST_COMPAT_RULES) {
-  const env = signals.env ?? process.env;
-  const identity = detectHostIdentity(signals);
-  let ruleEditsFormat;
-  let callBudgetSec = MCP_CALL_BUDGET_SEC;
-  let inlineMaxBytes = DEFAULT_INLINE_MAX_BYTES;
-  const matchedRuleIds = [];
-  const reasons = [];
-  for (const rule of rules) {
-    if (!ruleMatchesIdentity(rule, identity)) continue;
-    matchedRuleIds.push(rule.id);
-    if (rule.editsFormat !== void 0) ruleEditsFormat = rule.editsFormat;
-    if (rule.callBudgetSec !== void 0) callBudgetSec = rule.callBudgetSec;
-    if (rule.inlineMaxBytes !== void 0) inlineMaxBytes = rule.inlineMaxBytes;
-    if (rule.reason) reasons.push(rule.reason);
-  }
-  const envMode = parseEditsFormatMode(env.AGY_FAST_EDITS_FORMAT);
-  const cfgMode = parseEditsFormatMode(signals.configEditsFormat);
-  let editsFormat = "array";
-  let editsFormatSource = "token-saving-default";
-  let reason = reasons[0] ?? "Defaulting to native array edits for lower output token usage (~2.6-3.3x cheaper than double-escaped JSON strings)";
-  if (envMode === "array" || envMode === "string") {
-    editsFormat = envMode;
-    editsFormatSource = "env-override";
-    reason = `Forced by AGY_FAST_EDITS_FORMAT=${envMode}`;
-  } else if (envMode !== "auto" && (cfgMode === "array" || cfgMode === "string")) {
-    editsFormat = cfgMode;
-    editsFormatSource = "config-override";
-    reason = `Configured in agy-fast config.json (editsFormat=${cfgMode})`;
-  } else if (ruleEditsFormat !== void 0) {
-    editsFormat = ruleEditsFormat;
-    editsFormatSource = "compat-rule";
-  }
-  return {
-    identity,
-    editsFormat,
-    editsFormatSource,
-    callBudgetSec,
-    inlineMaxBytes,
-    matchedRuleIds,
-    reason
-  };
-}
-function getConfigPath(env = process.env) {
-  const custom = env.AGY_FAST_CACHE_DIR?.trim();
-  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os2.homedir() : env.HOME || env.USERPROFILE || os2.homedir();
-  const cacheDir = custom ? path2.resolve(custom) : path2.join(home, ".gemini", "cache", "agy-fast");
-  return path2.join(cacheDir, "config.json");
-}
-function readSavedEditsFormatSync(env = process.env) {
-  try {
-    const raw = fs.readFileSync(getConfigPath(env), "utf8");
-    const parsed = JSON.parse(raw);
-    return parseEditsFormatMode(parsed?.editsFormat) ?? void 0;
-  } catch {
-    return void 0;
-  }
-}
-
-// src/tools/apply-edits.ts
-import { isUtf8 } from "node:buffer";
-import { promises as fs3 } from "node:fs";
-import path4 from "node:path";
-
-// src/utils/arg-validation.ts
-function isPlainObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-function describeValueType(value) {
-  if (value === null) return "null";
-  if (value === void 0) return "undefined";
-  if (Array.isArray(value)) return `array (len=${value.length})`;
-  if (typeof value === "boolean") return `boolean (${String(value)})`;
-  if (typeof value === "number") return `number (${String(value)})`;
-  if (typeof value === "string") return `string (len=${value.length})`;
-  return typeof value;
-}
-function parseMaybeJsonArray(value) {
-  if (value === void 0) {
-    return { ok: false, kind: "missing", detail: "undefined" };
-  }
-  if (Array.isArray(value)) {
-    return { ok: true, value };
-  }
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return { ok: false, kind: "wrong_type", detail: "empty string" };
-    }
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed)) {
-        return { ok: true, value: parsed };
-      }
-      if (parsed === null || typeof parsed === "boolean") {
-        return {
-          ok: false,
-          kind: "corrupted_literal",
-          detail: describeValueType(parsed),
-          value: parsed
-        };
-      }
-      return {
-        ok: false,
-        kind: "invalid_json",
-        detail: `decoded to ${describeValueType(parsed)} instead of a JSON array`
-      };
-    } catch (err) {
-      return {
-        ok: false,
-        kind: "invalid_json",
-        detail: err instanceof Error ? err.message : String(err)
-      };
-    }
-  }
-  return {
-    ok: false,
-    kind: "wrong_type",
-    detail: describeValueType(value)
-  };
-}
-function formatCorruptedArrayError(options) {
-  const details = options.items.slice(0, 8).map(
-    (item) => `- ${item.label}: received ${describeValueType(item.value)} instead of ${item.expected ?? "an object"}`
-  );
-  if (options.items.length > 8) {
-    details.push(`- ... (+${options.items.length - 8} more corrupted entries)`);
-  }
-  return [
-    `${options.header}: nested argument serialization corruption detected in call_mcp_tool.`,
-    ...details,
-    "",
-    `Hint: untyped call_mcp_tool Arguments can occasionally collapse nested objects/arrays into booleans, null, or an empty array. Do NOT retry the same ${options.toolName} payload \u2014 ${options.fallbackAdvice}`
-  ].join("\n");
-}
-
-// src/utils/fs-utils.ts
-import { promises as fs2 } from "node:fs";
-import os3 from "node:os";
-import path3 from "node:path";
-var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
-  ".git",
-  ".hg",
-  ".svn",
-  "node_modules",
-  "dist",
-  "build",
-  "out",
-  "target",
-  ".next",
-  ".nuxt",
-  ".svelte-kit",
-  ".cache",
-  ".turbo",
-  "coverage",
-  "__pycache__",
-  ".venv",
-  "venv",
-  ".tox",
-  ".pytest_cache",
-  ".mypy_cache",
-  ".ruff_cache",
-  ".gradle",
-  ".idea",
-  "vendor"
-]);
-function expandHome(inputPath) {
-  if (inputPath === "~") return os3.homedir();
-  if (inputPath.startsWith("~/") || inputPath.startsWith("~\\")) {
-    return path3.join(os3.homedir(), inputPath.slice(2));
-  }
-  return inputPath;
-}
-function resolvePath(inputPath, baseDir) {
-  const expanded = expandHome(inputPath.trim());
-  const root = baseDir ? path3.resolve(expandHome(baseDir)) : process.cwd();
-  return path3.resolve(root, expanded);
-}
-function toPosixPath(p) {
-  return p.split(path3.sep).join("/");
-}
-function isLikelyBinary(buf) {
-  const limit = Math.min(buf.length, 8192);
-  for (let i = 0; i < limit; i++) {
-    if (buf[i] === 0) return true;
-  }
-  return false;
-}
-function hasUtf8Bom(buf) {
-  return buf.length >= 3 && buf[0] === 239 && buf[1] === 187 && buf[2] === 191;
-}
-function detectUtf16Bom(buf) {
-  if (buf.length < 2) return null;
-  if (buf[0] === 255 && buf[1] === 254) {
-    if (buf.length >= 4 && buf[2] === 0 && buf[3] === 0) {
-      return null;
-    }
-    return "UTF-16 LE";
-  }
-  if (buf[0] === 254 && buf[1] === 255) {
-    return "UTF-16 BE";
-  }
-  return null;
-}
-async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
-  const stat = await fs2.stat(filePath);
-  if (!stat.isFile()) {
-    throw new Error(`Not a regular file: ${filePath}`);
-  }
-  if (stat.size > maxBytes) {
-    throw new Error(
-      `File exceeds maximum size (${stat.size} bytes > ${maxBytes} bytes): ${filePath}`
-    );
-  }
-  const buf = await fs2.readFile(filePath);
-  const utf16Bom = detectUtf16Bom(buf);
-  if (utf16Bom) {
-    throw new Error(
-      `UTF-16 encoded file is not supported (convert to UTF-8 first): ${filePath} [${utf16Bom}]`
-    );
-  }
-  if (isLikelyBinary(buf)) {
-    throw new Error(`Binary file cannot be read as text: ${filePath}`);
-  }
-  const hasBom = hasUtf8Bom(buf);
-  const rawContent = (hasBom ? buf.subarray(3) : buf).toString("utf8");
-  let crlfCount = 0;
-  let lfOnlyCount = 0;
-  for (let i = 0; i < rawContent.length; i++) {
-    if (rawContent[i] === "\n") {
-      if (i > 0 && rawContent[i - 1] === "\r") crlfCount++;
-      else lfOnlyCount++;
-    }
-  }
-  const eol = crlfCount > lfOnlyCount ? "\r\n" : "\n";
-  const mixedEol = crlfCount > 0 && lfOnlyCount > 0;
-  return {
-    content: rawContent,
-    rawContent,
-    eol,
-    mixedEol,
-    hasBom,
-    size: stat.size,
-    mode: stat.mode & 4095,
-    rawBuffer: buf
-  };
-}
-function globToRegExp(pattern) {
-  const normalized = pattern.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\*{3,}/g, "**").replace(/(?:\*\*\/)+/g, "**/");
-  const re = `^${compileGlobBody(normalized)}$`;
-  try {
-    return new RegExp(re);
-  } catch (err) {
-    throw new Error(
-      `Invalid glob pattern '${pattern}': ${err instanceof Error ? err.message : String(err)}`
-    );
-  }
-}
-function compileGlobBody(normalized) {
-  let re = "";
-  let i = 0;
-  while (i < normalized.length) {
-    const ch = normalized[i];
-    if (ch === "*") {
-      if (normalized[i + 1] === "*") {
-        if (normalized[i + 2] === "/") {
-          re += "(?:.*/)?";
-          i += 3;
-        } else {
-          re += ".*";
-          i += 2;
-        }
-      } else {
-        re += "[^/]*";
-        i += 1;
-      }
-    } else if (ch === "?") {
-      re += "[^/]";
-      i += 1;
-    } else if (ch === "[") {
-      const close = findClosingBracket(normalized, i);
-      if (close === -1) {
-        re += "\\[";
-        i += 1;
-      } else {
-        let inner = normalized.slice(i + 1, close);
-        const negated = inner.startsWith("!") || inner.startsWith("^");
-        if (negated) inner = inner.slice(1);
-        inner = inner.replace(/\\/g, "\\\\").replace(/\]/g, "\\]");
-        re += negated ? `(?!/)[${"^"}${inner}]` : `[${inner}]`;
-        i = close + 1;
-      }
-    } else if (ch === "{") {
-      const close = findMatchingBrace(normalized, i);
-      if (close === -1) {
-        re += "\\{";
-        i += 1;
-      } else {
-        const parts = splitBraceAlternatives(normalized.slice(i + 1, close));
-        const sub = parts.map((part) => compileGlobBody(part.replace(/\*{3,}/g, "**").replace(/(?:\*\*\/)+/g, "**/"))).join("|");
-        re += `(?:${sub})`;
-        i = close + 1;
-      }
-    } else if (".+^$()|\\".includes(ch)) {
-      re += "\\" + ch;
-      i += 1;
-    } else {
-      re += ch;
-      i += 1;
-    }
-  }
-  return re;
-}
-function findClosingBracket(str, openIdx) {
-  let i = openIdx + 1;
-  if (i < str.length && (str[i] === "!" || str[i] === "^")) i++;
-  if (i < str.length && str[i] === "]") i++;
-  for (; i < str.length; i++) {
-    if (str[i] === "]") return i;
-  }
-  return -1;
-}
-function findMatchingBrace(str, openIdx) {
-  let depth = 0;
-  for (let i = openIdx; i < str.length; i++) {
-    if (str[i] === "[") {
-      const close = findClosingBracket(str, i);
-      if (close !== -1) {
-        i = close;
-        continue;
-      }
-    }
-    if (str[i] === "{") depth++;
-    else if (str[i] === "}") {
-      depth--;
-      if (depth === 0) return i;
-    }
-  }
-  return -1;
-}
-function splitBraceAlternatives(inner) {
-  const parts = [];
-  let depth = 0;
-  let start = 0;
-  for (let i = 0; i < inner.length; i++) {
-    const ch = inner[i];
-    if (ch === "[") {
-      const close = findClosingBracket(inner, i);
-      if (close !== -1) {
-        i = close;
-        continue;
-      }
-    }
-    if (ch === "{") depth++;
-    else if (ch === "}") depth--;
-    else if (ch === "," && depth === 0) {
-      parts.push(inner.slice(start, i));
-      start = i + 1;
-    }
-  }
-  parts.push(inner.slice(start));
-  return parts;
-}
-async function walkFiles(rootDir, options = {}) {
-  const maxFiles = Math.max(0, Math.trunc(options.maxFiles ?? 5e3));
-  const maxDepth = options.maxDepth ?? 32;
-  const includeHidden = options.includeHidden ?? false;
-  const ignoreDirs = options.ignoreDirs ?? DEFAULT_IGNORE_DIRS;
-  const fileFilter = options.fileFilter;
-  const timeoutMs = options.timeoutMs !== void 0 && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Math.max(1, Math.trunc(options.timeoutMs)) : null;
-  const deadline = timeoutMs !== null ? Date.now() + timeoutMs : null;
-  const maxDirs = options.maxDirs !== void 0 && Number.isFinite(options.maxDirs) && options.maxDirs > 0 ? Math.max(1, Math.trunc(options.maxDirs)) : null;
-  const files = [];
-  let truncated = false;
-  let timedOut = false;
-  let dirsTruncated = false;
-  let visitedDirs = 0;
-  const MAX_CONCURRENT_READDIRS = 16;
-  let activeReaddirs = 0;
-  const waitQueue = [];
-  const drainWaiters = () => {
-    while (waitQueue.length > 0) {
-      waitQueue.shift()();
-    }
-  };
-  const markTruncated = () => {
-    if (truncated) return;
-    truncated = true;
-    drainWaiters();
-  };
-  const withinBudget = () => {
-    if (truncated) return false;
-    if (deadline !== null && Date.now() >= deadline) {
-      timedOut = true;
-      markTruncated();
-      return false;
-    }
-    return true;
-  };
-  const timeoutTimer = timeoutMs !== null ? setTimeout(() => {
-    timedOut = true;
-    markTruncated();
-  }, timeoutMs) : null;
-  timeoutTimer?.unref();
-  const readDirBounded = async (dir) => {
-    if (!withinBudget()) return null;
-    while (activeReaddirs >= MAX_CONCURRENT_READDIRS) {
-      await new Promise((resolve) => waitQueue.push(resolve));
-      if (!withinBudget()) return null;
-    }
-    if (!withinBudget()) return null;
-    if (maxDirs !== null && visitedDirs >= maxDirs) {
-      dirsTruncated = true;
-      markTruncated();
-      return null;
-    }
-    visitedDirs++;
-    activeReaddirs++;
-    try {
-      return await fs2.readdir(dir, { withFileTypes: true });
-    } finally {
-      activeReaddirs--;
-      if (truncated) {
-        drainWaiters();
-      } else {
-        const next = waitQueue.shift();
-        if (next) next();
-      }
-    }
-  };
-  const scanDir = async (dir, relDir) => {
-    if (!withinBudget()) return { localFiles: [], subdirs: [] };
-    let entries;
-    try {
-      entries = await readDirBounded(dir);
-    } catch {
-      return { localFiles: [], subdirs: [] };
-    }
-    if (!entries || !withinBudget()) return { localFiles: [], subdirs: [] };
-    entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-    const localFiles = [];
-    const subdirs = [];
-    for (const entry of entries) {
-      const name = entry.name;
-      if (!includeHidden && name.startsWith(".")) {
-        if (!(entry.isDirectory() && name === ".agents")) {
-          continue;
-        }
-      }
-      const relPosix = relDir ? `${relDir}/${name}` : name;
-      if (entry.isDirectory()) {
-        if (ignoreDirs.has(name)) continue;
-        subdirs.push({ abs: path3.join(dir, name), rel: relPosix });
-      } else if (entry.isFile()) {
-        if (fileFilter && !fileFilter(relPosix)) continue;
-        localFiles.push(relPosix);
-      }
-    }
-    return { localFiles, subdirs };
-  };
-  async function visit(dir, relDir, depth, prefetched) {
-    if (!withinBudget() || depth > maxDepth) return;
-    const { localFiles, subdirs } = await (prefetched ?? scanDir(dir, relDir));
-    if (!withinBudget()) return;
-    for (const relPosix of localFiles) {
-      if (files.length >= maxFiles) {
-        markTruncated();
-        return;
-      }
-      files.push(relPosix);
-    }
-    if (depth >= maxDepth || subdirs.length === 0) return;
-    const batchSize = 8;
-    for (let i = 0; i < subdirs.length && withinBudget(); i += batchSize) {
-      const slice = subdirs.slice(i, i + batchSize);
-      const prefetches = slice.map((sub) => scanDir(sub.abs, sub.rel));
-      try {
-        for (let j = 0; j < slice.length && withinBudget(); j++) {
-          await visit(slice[j].abs, slice[j].rel, depth + 1, prefetches[j]);
-        }
-      } finally {
-        if (truncated) {
-          await Promise.allSettled(prefetches);
-        }
-      }
-    }
-  }
-  try {
-    await visit(rootDir, "", 0);
-  } finally {
-    if (timeoutTimer) clearTimeout(timeoutTimer);
-  }
-  return {
-    files,
-    truncated,
-    ...timedOut ? { timedOut: true } : {},
-    ...dirsTruncated ? { dirsTruncated: true } : {}
-  };
-}
-
 // src/tools/apply-edits.ts
 function computeLineStarts(text) {
   const starts = [0];
@@ -3451,7 +2517,7 @@ function countLines(text) {
 }
 var OVERWRITE_HEADER_PEEK_BYTES = 8192;
 async function readFileHeaderBytes(filePath, maxBytes = OVERWRITE_HEADER_PEEK_BYTES) {
-  const fh = await fs3.open(filePath, "r");
+  const fh = await fs2.open(filePath, "r");
   try {
     const buf = Buffer.allocUnsafe(maxBytes);
     const { bytesRead } = await fh.read(buf, 0, maxBytes, 0);
@@ -3478,7 +2544,7 @@ async function readOverwriteOriginal(writeTargetPath, size, relPath) {
       return { ok: false, error: nonTextErr2 };
     }
   }
-  const buffer = await fs3.readFile(writeTargetPath);
+  const buffer = await fs2.readFile(writeTargetPath);
   const nonTextErr = classifyNonTextOverwriteBuffer(buffer, relPath);
   if (nonTextErr) {
     return { ok: false, error: nonTextErr };
@@ -3501,20 +2567,20 @@ function isGitInternalPath(filePath, platform = process.platform) {
 }
 async function canonicalizeTargetPath(absPath) {
   try {
-    return await fs3.realpath(absPath);
+    return await fs2.realpath(absPath);
   } catch {
     const trailingSegments = [];
     let current = absPath;
     while (true) {
-      const parent = path4.dirname(current);
+      const parent = path3.dirname(current);
       if (parent === current) {
         return absPath;
       }
-      trailingSegments.push(path4.basename(current));
+      trailingSegments.push(path3.basename(current));
       current = parent;
       try {
-        const realAncestor = await fs3.realpath(current);
-        return path4.join(realAncestor, ...trailingSegments.reverse());
+        const realAncestor = await fs2.realpath(current);
+        return path3.join(realAncestor, ...trailingSegments.reverse());
       } catch {
       }
     }
@@ -3522,17 +2588,17 @@ async function canonicalizeTargetPath(absPath) {
 }
 async function findMissingAncestorDirs(dir) {
   const missing = [];
-  let current = path4.resolve(dir);
+  let current = path3.resolve(dir);
   while (true) {
     try {
-      await fs3.lstat(current);
+      await fs2.lstat(current);
       break;
     } catch (err) {
       if (err?.code !== "ENOENT") {
         break;
       }
       missing.push(current);
-      const parent = path4.dirname(current);
+      const parent = path3.dirname(current);
       if (parent === current) break;
       current = parent;
     }
@@ -3547,7 +2613,7 @@ async function commitPlannedWrites(plans) {
     for (const plan of plans) {
       if (plan.isNoOp) continue;
       const target = plan.writeTargetPath;
-      const dir = path4.dirname(target);
+      const dir = path3.dirname(target);
       const missingDirs = await findMissingAncestorDirs(dir);
       for (let i = missingDirs.length - 1; i >= 0; i--) {
         const d = missingDirs[i];
@@ -3556,42 +2622,42 @@ async function commitPlannedWrites(plans) {
           createdDirs.push(d);
         }
       }
-      await fs3.mkdir(dir, { recursive: true });
-      const tmpPath = path4.join(
+      await fs2.mkdir(dir, { recursive: true });
+      const tmpPath = path3.join(
         dir,
         `.agy-tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
       );
       try {
-        await fs3.writeFile(tmpPath, plan.newContent, "utf8");
+        await fs2.writeFile(tmpPath, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
-          await fs3.chmod(tmpPath, plan.originalMode);
+          await fs2.chmod(tmpPath, plan.originalMode);
         }
       } catch (tmpErr) {
         try {
-          await fs3.unlink(tmpPath);
+          await fs2.unlink(tmpPath);
         } catch {
         }
         throw tmpErr;
       }
       try {
-        await fs3.rename(tmpPath, target);
+        await fs2.rename(tmpPath, target);
         written.push(plan);
       } catch (renameErr) {
         try {
-          await fs3.unlink(tmpPath);
+          await fs2.unlink(tmpPath);
         } catch {
         }
         written.push(plan);
         if (plan.originalSymlinkTarget) {
           try {
-            await fs3.unlink(target);
+            await fs2.unlink(target);
           } catch {
           }
         }
-        await fs3.writeFile(target, plan.newContent, "utf8");
+        await fs2.writeFile(target, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
           try {
-            await fs3.chmod(target, plan.originalMode);
+            await fs2.chmod(target, plan.originalMode);
           } catch {
           }
         }
@@ -3604,23 +2670,23 @@ async function commitPlannedWrites(plans) {
       const target = item.writeTargetPath;
       try {
         if (item.originalSymlinkTarget) {
-          await fs3.unlink(target).catch(() => {
+          await fs2.unlink(target).catch(() => {
           });
-          await fs3.symlink(item.originalSymlinkTarget, target);
+          await fs2.symlink(item.originalSymlinkTarget, target);
         } else if (item.existed && item.originalBuffer !== null) {
-          await fs3.writeFile(target, item.originalBuffer);
+          await fs2.writeFile(target, item.originalBuffer);
           if (item.originalMode !== null && process.platform !== "win32") {
-            await fs3.chmod(target, item.originalMode);
+            await fs2.chmod(target, item.originalMode);
           }
         } else if (!item.existed) {
-          await fs3.unlink(target);
+          await fs2.unlink(target);
         }
       } catch {
       }
     }
     for (let i = createdDirs.length - 1; i >= 0; i--) {
       try {
-        await fs3.rmdir(createdDirs[i]);
+        await fs2.rmdir(createdDirs[i]);
       } catch {
       }
     }
@@ -3882,7 +2948,7 @@ async function runApplyEdits(input) {
   if (!input.dryRun && validatedVerify?.cwd) {
     const resolvedVerifyCwd = resolvePath(validatedVerify.cwd, baseCwd);
     try {
-      const st = await fs3.stat(resolvedVerifyCwd);
+      const st = await fs2.stat(resolvedVerifyCwd);
       if (!st.isDirectory()) {
         return {
           text: `Validation failed (0 files modified):
@@ -3908,7 +2974,7 @@ async function runApplyEdits(input) {
     }
     const absPath = resolvePath(entry.path, baseCwd);
     const writeTargetPath = await canonicalizeTargetPath(absPath);
-    const relPath = toPosixPath(path4.relative(baseCwd, absPath)) || path4.basename(absPath);
+    const relPath = toPosixPath(path3.relative(baseCwd, absPath)) || path3.basename(absPath);
     if (isGitInternalPath(absPath) || isGitInternalPath(writeTargetPath)) {
       errors.push(`${relPath}: refusing to modify Git internal metadata path (.git)`);
       continue;
@@ -3956,10 +3022,10 @@ async function runApplyEdits(input) {
       let originalMode = null;
       let originalSymlinkTarget = null;
       try {
-        const lst = await fs3.lstat(item.writeTargetPath);
+        const lst = await fs2.lstat(item.writeTargetPath);
         if (lst.isSymbolicLink()) {
           try {
-            const st = await fs3.stat(item.writeTargetPath);
+            const st = await fs2.stat(item.writeTargetPath);
             if (st.isDirectory()) {
               errors.push(`${item.relPath}: target path is a directory`);
               continue;
@@ -3991,7 +3057,7 @@ async function runApplyEdits(input) {
                 );
                 continue;
               }
-              originalSymlinkTarget = await fs3.readlink(item.writeTargetPath);
+              originalSymlinkTarget = await fs2.readlink(item.writeTargetPath);
             } else {
               errors.push(
                 `${item.relPath}: ${statErr instanceof Error ? statErr.message : String(statErr)}`
@@ -4000,7 +3066,7 @@ async function runApplyEdits(input) {
             }
           }
         } else {
-          const st = await fs3.stat(item.writeTargetPath);
+          const st = await fs2.stat(item.writeTargetPath);
           if (st.isDirectory()) {
             errors.push(`${item.relPath}: target path is a directory`);
             continue;
@@ -4233,8 +3299,8 @@ Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
 }
 
 // src/tools/batch-search.ts
-import { promises as fs4 } from "node:fs";
-import path5 from "node:path";
+import { promises as fs3 } from "node:fs";
+import path4 from "node:path";
 
 // src/utils/fuzzy-match.ts
 function findContiguousIndex(haystack, needle) {
@@ -4728,7 +3794,7 @@ function resolveFileTypeGlobs(fileType) {
 }
 function fileTypeMatcher(fileType) {
   const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
-  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path5.basename(file)));
+  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path4.basename(file)));
 }
 async function runTextOrRegexWithRg(query, searchRoot, baseCwd, budget) {
   const maxResults = clampInt(query.maxResults, 1, 200, 40);
@@ -4736,7 +3802,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd, budget) {
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
   const typeGlobs = resolveFileTypeGlobs(query.fileType);
   const matchesType = fileTypeMatcher(query.fileType);
-  const fileStat = await fs4.stat(searchRoot);
+  const fileStat = await fs3.stat(searchRoot);
   const isFileTarget = fileStat.isFile();
   if (isFileTarget) {
     if (typeGlobs && !matchesType(searchRoot)) {
@@ -4750,12 +3816,12 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd, budget) {
       const rawGlob = negated ? query.glob.slice(1) : query.glob;
       const globRe = globToRegExp(rawGlob);
       const relPosix = relativeFile(baseCwd, searchRoot);
-      const matched = globRe.test(relPosix) || globRe.test(path5.basename(searchRoot));
+      const matched = globRe.test(relPosix) || globRe.test(path4.basename(searchRoot));
       if (negated ? matched : !matched) {
         return { files: [], totalMatches: 0, truncated: false };
       }
     }
-    const fh = await fs4.open(searchRoot, "r");
+    const fh = await fs3.open(searchRoot, "r");
     try {
       const head = Buffer.alloc(Math.min(fileStat.size, 8192));
       const { bytesRead } = await fh.read(head, 0, head.length, 0);
@@ -4782,10 +3848,10 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd, budget) {
   if (query.glob) {
     args.push(`--glob=${query.glob}`);
   }
-  const relNative = path5.relative(baseCwd, searchRoot);
+  const relNative = path4.relative(baseCwd, searchRoot);
   const relRoot = toPosixPath(relNative);
-  const isInsideBaseCwd = relRoot === "" || relRoot !== ".." && !relRoot.startsWith("../") && !path5.isAbsolute(relRoot);
-  const rgSearchTarget = isInsideBaseCwd ? !relNative ? "." : relNative === "-" ? `.${path5.sep}-` : relNative : searchRoot;
+  const isInsideBaseCwd = relRoot === "" || relRoot !== ".." && !relRoot.startsWith("../") && !path4.isAbsolute(relRoot);
+  const rgSearchTarget = isInsideBaseCwd ? !relNative ? "." : relNative === "-" ? `.${path4.sep}-` : relNative : searchRoot;
   const rootSegments = isInsideBaseCwd ? relRoot ? relRoot.split("/") : [] : toPosixPath(searchRoot).split("/").filter(Boolean);
   const positiveGlob = query.glob && !query.glob.startsWith("!") ? query.glob : null;
   for (const dir of [
@@ -4921,9 +3987,9 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd, budget) {
     }
   }
   const toRgArgPath = (rawFile) => {
-    const rel = path5.relative(baseCwd, path5.resolve(baseCwd, rawFile));
-    const chosenPath = rel && rel !== ".." && !rel.startsWith(`..${path5.sep}`) && !path5.isAbsolute(rel) ? rel : rawFile;
-    return chosenPath === "-" ? `.${path5.sep}-` : chosenPath;
+    const rel = path4.relative(baseCwd, path4.resolve(baseCwd, rawFile));
+    const chosenPath = rel && rel !== ".." && !rel.startsWith(`..${path4.sep}`) && !path4.isAbsolute(rel) ? rel : rawFile;
+    return chosenPath === "-" ? `.${path4.sep}-` : chosenPath;
   };
   const rgChunks = [];
   let currentChunk = [];
@@ -5158,12 +4224,12 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd, budget) {
     }
     return globNegated ? !matched : matched;
   };
-  const stat = await fs4.stat(searchRoot);
+  const stat = await fs3.stat(searchRoot);
   const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
   let targetFiles;
   let discoveryBudgetExceeded = false;
   if (stat.isFile()) {
-    const relPosix = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
+    const relPosix = toPosixPath(path4.relative(baseCwd, searchRoot)) || path4.basename(searchRoot);
     targetFiles = globMatchesFile(relPosix) ? [{ abs: searchRoot, rel: relativeFile(baseCwd, searchRoot) }] : [];
   } else {
     const includeHidden = Boolean(
@@ -5195,12 +4261,12 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd, budget) {
     if (walked.timedOut || walked.dirsTruncated) {
       discoveryBudgetExceeded = true;
     }
-    const rootRel = toPosixPath(path5.relative(baseCwd, searchRoot));
+    const rootRel = toPosixPath(path4.relative(baseCwd, searchRoot));
     const useFastPrefix = Boolean(
-      rootRel === "" || !rootRel.startsWith("..") && !path5.isAbsolute(rootRel)
+      rootRel === "" || !rootRel.startsWith("..") && !path4.isAbsolute(rootRel)
     );
     targetFiles = walked.files.map((rel) => {
-      const abs = path5.join(searchRoot, rel);
+      const abs = path4.join(searchRoot, rel);
       const displayRel = useFastPrefix ? rootRel ? `${rootRel}/${rel}` : rel : relativeFile(baseCwd, abs);
       return { abs, rel: displayRel };
     });
@@ -5270,9 +4336,9 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd, budget) {
     const results = await Promise.all(
       batch.map(async ({ abs: absFile, rel: relFile }) => {
         try {
-          const st = await fs4.stat(absFile);
+          const st = await fs3.stat(absFile);
           if (st.size > 2 * 1024 * 1024) return null;
-          const buf = await fs4.readFile(absFile);
+          const buf = await fs3.readFile(absFile);
           if (isLikelyBinary(buf)) return null;
           if (patternBuf && buf.indexOf(patternBuf) === -1) return null;
           const content = buf.toString("utf8");
@@ -5404,13 +4470,13 @@ function buildGlobFallbackPlan(pattern) {
   return null;
 }
 async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sortBy, notePrefix) {
-  const relPrefix = toPosixPath(path5.relative(baseCwd, searchRoot));
+  const relPrefix = toPosixPath(path4.relative(baseCwd, searchRoot));
   const sortedFiles = [...walked.files].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
   if (sortBy === "mtime") {
     const mtimes = /* @__PURE__ */ new Map();
     for (let i = 0; i < sortedFiles.length; i += 32) {
       await Promise.all(sortedFiles.slice(i, i + 32).map(async (file) => {
-        const stat = await fs4.lstat(path5.join(searchRoot, file)).catch(() => void 0);
+        const stat = await fs3.lstat(path4.join(searchRoot, file)).catch(() => void 0);
         mtimes.set(file, stat?.mtimeMs ?? -Infinity);
       }));
     }
@@ -5448,8 +4514,8 @@ async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget, budget) {
   const matchBasename = !pattern.includes("/");
   const includeHidden = patternTargetsHidden(pattern);
   if (isFileTarget) {
-    const rel = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
-    const base = path5.basename(searchRoot);
+    const rel = toPosixPath(path4.relative(baseCwd, searchRoot)) || path4.basename(searchRoot);
+    const base = path4.basename(searchRoot);
     const matched = matcher.test(rel) || matchBasename && matcher.test(base);
     if (matched) return rel;
     const fallback2 = buildGlobFallbackPlan(pattern);
@@ -5518,7 +4584,7 @@ ${rel}` : fallback2.emptyMessage;
   return "(no files matched)";
 }
 function relativeFile(baseCwd, file) {
-  return toPosixPath(path5.relative(baseCwd, path5.resolve(baseCwd, file))) || path5.basename(file);
+  return toPosixPath(path4.relative(baseCwd, path4.resolve(baseCwd, file))) || path4.basename(file);
 }
 async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget, budget) {
   const pattern = query.pattern.trim();
@@ -5535,7 +4601,7 @@ async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget, budget) {
     timeoutMs: walkRemainingMs,
     maxDirs: budget.walkMaxDirs
   });
-  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path5.resolve(searchRoot, file)));
+  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path4.resolve(searchRoot, file)));
   const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
   const budgetHit = Boolean(walked.timedOut || walked.dirsTruncated);
   if (matches.length === 0) {
@@ -6141,12 +5207,12 @@ async function executeSingleQuery(query, index, baseCwd, useRg, budget) {
     const searchRoot = query.path ? resolvePath(query.path, baseCwd) : baseCwd;
     let targetStat;
     try {
-      targetStat = await fs4.stat(searchRoot);
+      targetStat = await fs3.stat(searchRoot);
     } catch {
       throw new Error(`Path does not exist: ${query.path || baseCwd}`);
     }
     if (query.type === "git") {
-      const gitCwd = targetStat.isFile() ? path5.dirname(searchRoot) : searchRoot;
+      const gitCwd = targetStat.isFile() ? path4.dirname(searchRoot) : searchRoot;
       const out = await runGitQuery(query, gitCwd, budget);
       return { header, text: `${header}
 ${out}` };
@@ -6266,7 +5332,7 @@ async function runBatchSearch(input, options = {}) {
   const queries = rawQueries;
   const baseCwd = resolvePath(input.cwd || process.cwd());
   try {
-    const st = await fs4.stat(baseCwd);
+    const st = await fs3.stat(baseCwd);
     if (!st.isDirectory()) {
       return { text: `Error: cwd is not a directory: ${baseCwd}`, isError: true };
     }
@@ -6347,7 +5413,7 @@ function clampInt(val, min, max, fallback = min) {
 }
 
 // src/tools/read-slices.ts
-import path6 from "node:path";
+import path5 from "node:path";
 function isRegexStartContext(line, slashIdx) {
   let j = slashIdx - 1;
   while (j >= 0 && /\s/.test(line[j])) j--;
@@ -8365,7 +7431,7 @@ function extractSfcSymbols(lines, mode) {
   return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
 }
 function extractSymbolsFromLines(filePath, lines) {
-  const ext = path6.extname(filePath).toLowerCase();
+  const ext = path5.extname(filePath).toLowerCase();
   switch (ext) {
     case ".ts":
     case ".tsx":
@@ -8787,7 +7853,7 @@ async function runReadSlices(input) {
     const outlineResults = await Promise.all(
       outlines.map(async (rawPath) => {
         const absPath = resolvePath(rawPath, baseCwd);
-        const relPath = toPosixPath(path6.relative(baseCwd, absPath)) || path6.basename(absPath);
+        const relPath = toPosixPath(path5.relative(baseCwd, absPath)) || path5.basename(absPath);
         try {
           const { lines } = await loadLines(absPath);
           const symbols = extractSymbolsFromLines(absPath, lines);
@@ -8828,7 +7894,7 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`
           };
         }
         const absPath = resolvePath(req.path, baseCwd);
-        const relPath = toPosixPath(path6.relative(baseCwd, absPath)) || path6.basename(absPath);
+        const relPath = toPosixPath(path5.relative(baseCwd, absPath)) || path5.basename(absPath);
         if (!Array.isArray(req.ranges) || req.ranges.length === 0) {
           return {
             kind: "static",
@@ -9010,7 +8076,7 @@ async function runQuickOutline(input) {
 }
 
 // src/tools/run-checks.ts
-import { promises as fs5 } from "node:fs";
+import { promises as fs4 } from "node:fs";
 import { performance } from "node:perf_hooks";
 async function mapWithConcurrency(items, concurrency, worker) {
   const results = new Array(items.length);
@@ -9088,7 +8154,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
   }
   const baseCwd = resolvePath(input.cwd || process.cwd());
   try {
-    const st = await fs5.stat(baseCwd);
+    const st = await fs4.stat(baseCwd);
     if (!st.isDirectory()) {
       return { text: `Error: cwd is not a directory: ${baseCwd}`, isError: true };
     }
@@ -9120,7 +8186,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
     const cmdCwd = trimmedSpecCwd ? resolvePath(trimmedSpecCwd, baseCwd) : baseCwd;
     if (trimmedSpecCwd) {
       try {
-        const st = await fs5.stat(cmdCwd);
+        const st = await fs4.stat(cmdCwd);
         if (!st.isDirectory()) {
           return {
             text: `Error: commands[${i}].cwd is not a directory: ${cmdCwd}`,
@@ -10171,12 +9237,982 @@ function shouldCliExitNonZero(tool, result) {
   ) || tool === "apply_edits" && /(?:^|\n)Verify \[(?:FAIL|TIMEOUT|ERROR)\b/.test(result.text);
 }
 
-// src/mcp-server.ts
+// src/mcp-server-core.ts
+import fs6 from "node:fs";
+import os4 from "node:os";
+import path7 from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+
+// src/protocol/mcp.ts
+import { fileURLToPath } from "node:url";
+var SUPPORTED_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
+  "2025-11-25",
+  "2025-06-18",
+  "2025-03-26",
+  "2024-11-05"
+]);
+var DEFAULT_PROTOCOL_VERSION = "2025-03-26";
+var ROOTS_REQUEST_TIMEOUT_MS = 1e3;
+var MAX_KNOWN_ROOTS_IDS = 64;
+var MAX_FRAME_BYTES = 64 * 1024 * 1024;
+var McpStdioServer = class {
+  tools = /* @__PURE__ */ new Map();
+  serverName;
+  serverVersion;
+  inFlight = 0;
+  stdinEnded = false;
+  onDrainExit;
+  onWorkspaceRoots;
+  shouldRequestRoots;
+  onInitialize;
+  sendToClient;
+  clientSupportsRoots = false;
+  rootsDirty = false;
+  rootsRequestCount = 0;
+  lastAppliedRootsSeq = 0;
+  pendingRoots = /* @__PURE__ */ new Map();
+  knownRootsIds = /* @__PURE__ */ new Map();
+  rootsWaiters = /* @__PURE__ */ new Set();
+  activeOutgoingQueue = null;
+  initWriteInFlight = 0;
+  postInitOutgoingQueue = [];
+  rootsTimeoutMs;
+  maxFrameBytes;
+  constructor(options) {
+    this.serverName = options.name;
+    this.serverVersion = options.version;
+    this.onWorkspaceRoots = options.onWorkspaceRoots;
+    this.shouldRequestRoots = options.shouldRequestRoots;
+    this.onInitialize = options.onInitialize;
+    this.rootsTimeoutMs = typeof options.rootsTimeoutMs === "number" && Number.isFinite(options.rootsTimeoutMs) && options.rootsTimeoutMs > 0 ? Math.trunc(options.rootsTimeoutMs) : ROOTS_REQUEST_TIMEOUT_MS;
+    this.maxFrameBytes = typeof options.maxFrameBytes === "number" && Number.isFinite(options.maxFrameBytes) && options.maxFrameBytes > 0 ? Math.trunc(options.maxFrameBytes) : MAX_FRAME_BYTES;
+  }
+  flushRootsWaiters() {
+    for (const waiter of this.rootsWaiters) {
+      let stillWaiting = false;
+      for (const pending of this.pendingRoots.values()) {
+        if (pending.seq <= waiter.minSeq) {
+          stillWaiting = true;
+          break;
+        }
+      }
+      if (!stillWaiting) {
+        this.rootsWaiters.delete(waiter);
+        waiter.resolve();
+      }
+    }
+  }
+  settleAllPendingRoots() {
+    for (const pending of this.pendingRoots.values()) {
+      clearTimeout(pending.timer);
+    }
+    this.pendingRoots.clear();
+    for (const waiter of this.rootsWaiters) {
+      waiter.resolve();
+    }
+    this.rootsWaiters.clear();
+  }
+  waitForRoots() {
+    if (this.pendingRoots.size === 0 || this.stdinEnded) {
+      return Promise.resolve();
+    }
+    if (this.activeOutgoingQueue && this.activeOutgoingQueue.length > 0) {
+      const tasks = this.activeOutgoingQueue.splice(0, this.activeOutgoingQueue.length);
+      if (this.initWriteInFlight > 0) {
+        this.postInitOutgoingQueue.push(...tasks);
+      } else {
+        for (const task of tasks) {
+          try {
+            task();
+          } catch {
+          }
+        }
+      }
+    }
+    const minSeq = this.rootsRequestCount;
+    return new Promise((resolve) => {
+      this.rootsWaiters.add({ minSeq, resolve });
+    });
+  }
+  pruneKnownRootsIds() {
+    if (this.knownRootsIds.size <= MAX_KNOWN_ROOTS_IDS) return;
+    for (const key of this.knownRootsIds.keys()) {
+      if (this.knownRootsIds.size <= MAX_KNOWN_ROOTS_IDS) break;
+      if (!this.pendingRoots.has(key)) {
+        this.knownRootsIds.delete(key);
+      }
+    }
+  }
+  // Tool calls wait for the pending answer (bounded by rootsTimeoutMs and stdin EOF),
+  // so the first call already sees the workspace roots without ever deadlocking.
+  requestRoots(useContentLength) {
+    if (this.stdinEnded || !this.clientSupportsRoots || !this.onWorkspaceRoots || !this.sendToClient) {
+      return;
+    }
+    this.rootsRequestCount += 1;
+    const seq = this.rootsRequestCount;
+    const id = `agy-fast-roots-${seq}`;
+    const timer = setTimeout(() => {
+      if (this.pendingRoots.delete(id)) {
+        this.pruneKnownRootsIds();
+        this.flushRootsWaiters();
+      }
+    }, this.rootsTimeoutMs);
+    timer.unref();
+    this.pendingRoots.set(id, { seq, timer });
+    this.knownRootsIds.set(id, seq);
+    this.pruneKnownRootsIds();
+    const send = this.sendToClient;
+    const sendTask = () => {
+      if (this.stdinEnded) return;
+      send({ jsonrpc: "2.0", id, method: "roots/list" }, useContentLength);
+    };
+    if (this.activeOutgoingQueue) {
+      this.activeOutgoingQueue.push(sendTask);
+    } else {
+      sendTask();
+    }
+  }
+  receiveRoots(result) {
+    if (!result || typeof result !== "object") return;
+    const rawRoots = result.roots;
+    if (!Array.isArray(rawRoots)) return;
+    const paths = [];
+    for (const root of rawRoots) {
+      if (!root || typeof root !== "object") continue;
+      const uri = root.uri;
+      if (typeof uri !== "string" || !/^file:/i.test(uri)) continue;
+      try {
+        paths.push(fileURLToPath(uri));
+      } catch {
+      }
+    }
+    if (paths.length > 0) {
+      try {
+        this.onWorkspaceRoots?.(paths);
+      } catch {
+      }
+    }
+  }
+  registerTool(definition, handler) {
+    const name = typeof definition === "function" ? definition().name : definition.name;
+    this.tools.set(name, { definition, handler });
+  }
+  async handleMessage(raw, useContentLength = false) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: "Invalid Request" }
+      };
+    }
+    const msg = raw;
+    const hasId = Object.prototype.hasOwnProperty.call(msg, "id") && msg.id !== void 0;
+    const id = hasId ? msg.id ?? null : null;
+    const method = typeof msg.method === "string" ? msg.method : "";
+    if (!method && typeof id === "string" && this.knownRootsIds.has(id)) {
+      const seq = this.knownRootsIds.get(id);
+      this.knownRootsIds.delete(id);
+      const pending = this.pendingRoots.get(id);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pendingRoots.delete(id);
+      }
+      const errField = msg.error;
+      const hasError = errField !== void 0 && errField !== null;
+      try {
+        if (!hasError && seq >= this.lastAppliedRootsSeq) {
+          this.lastAppliedRootsSeq = seq;
+          for (const [oldId, oldPending] of this.pendingRoots.entries()) {
+            if (oldPending.seq < seq) {
+              clearTimeout(oldPending.timer);
+              this.pendingRoots.delete(oldId);
+            }
+          }
+          this.receiveRoots(msg.result);
+        }
+      } finally {
+        this.pruneKnownRootsIds();
+        this.flushRootsWaiters();
+      }
+      return null;
+    }
+    if (!method) {
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32600, message: "Invalid Request: missing method" }
+      };
+    }
+    if (!hasId) {
+      if (method === "notifications/initialized" || method === "notifications/roots/list_changed") {
+        if (this.clientSupportsRoots) {
+          this.rootsDirty = true;
+        }
+      }
+      return null;
+    }
+    if (method === "initialize") {
+      const requested = typeof msg.params?.protocolVersion === "string" ? msg.params.protocolVersion.trim() : "";
+      const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : DEFAULT_PROTOCOL_VERSION;
+      const capabilities = msg.params?.capabilities;
+      this.clientSupportsRoots = capabilities?.roots !== null && typeof capabilities?.roots === "object" && !Array.isArray(capabilities?.roots);
+      this.rootsDirty = this.clientSupportsRoots;
+      const rawClientInfo = msg.params?.clientInfo;
+      let clientInfo;
+      if (rawClientInfo !== null && typeof rawClientInfo === "object" && !Array.isArray(rawClientInfo)) {
+        const ci = rawClientInfo;
+        clientInfo = {
+          name: typeof ci.name === "string" ? ci.name : void 0,
+          version: typeof ci.version === "string" ? ci.version : void 0
+        };
+      }
+      try {
+        this.onInitialize?.({ clientInfo, protocolVersion });
+      } catch {
+      }
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion,
+          capabilities: {
+            tools: {}
+          },
+          serverInfo: {
+            name: this.serverName,
+            version: this.serverVersion
+          }
+        }
+      };
+    }
+    if (method === "ping") {
+      return { jsonrpc: "2.0", id, result: {} };
+    }
+    if (method === "tools/list") {
+      const definitions = [...this.tools.values()].map(
+        (t) => typeof t.definition === "function" ? t.definition() : t.definition
+      );
+      return { jsonrpc: "2.0", id, result: { tools: definitions } };
+    }
+    if (method === "resources/list") {
+      return { jsonrpc: "2.0", id, result: { resources: [] } };
+    }
+    if (method === "resources/templates/list") {
+      return { jsonrpc: "2.0", id, result: { resourceTemplates: [] } };
+    }
+    if (method === "prompts/list") {
+      return { jsonrpc: "2.0", id, result: { prompts: [] } };
+    }
+    if (method === "tools/call") {
+      const name = typeof msg.params?.name === "string" ? msg.params.name : "";
+      const tool = this.tools.get(name);
+      if (!tool) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32602, message: `Unknown tool: ${name}` }
+        };
+      }
+      const rawArgs = msg.params?.arguments;
+      let args;
+      if (rawArgs === void 0 || rawArgs === null) {
+        args = {};
+      } else if (typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+        args = rawArgs;
+      } else if (typeof rawArgs === "string" && rawArgs.trim().startsWith("{")) {
+        try {
+          const parsedArgs = JSON.parse(rawArgs);
+          if (parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)) {
+            args = parsedArgs;
+          } else {
+            return {
+              jsonrpc: "2.0",
+              id,
+              error: {
+                code: -32602,
+                message: `Invalid params: 'arguments' for '${name}' must be a JSON object`
+              }
+            };
+          }
+        } catch {
+          return {
+            jsonrpc: "2.0",
+            id,
+            error: {
+              code: -32602,
+              message: `Invalid params: malformed JSON string in 'arguments' for '${name}'`
+            }
+          };
+        }
+      } else {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32602,
+            message: `Invalid params: 'arguments' for '${name}' must be an object (received ${Array.isArray(rawArgs) ? "array" : typeof rawArgs})`
+          }
+        };
+      }
+      try {
+        const needRoots = this.clientSupportsRoots && Boolean(this.onWorkspaceRoots) && (this.shouldRequestRoots ? this.shouldRequestRoots(name, args) : true);
+        if (needRoots) {
+          if (this.rootsDirty && !this.stdinEnded) {
+            this.rootsDirty = false;
+            this.requestRoots(useContentLength);
+          }
+          await this.waitForRoots();
+        }
+        const res = await tool.handler(args);
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{ type: "text", text: res.text }],
+            isError: Boolean(res.isError)
+          }
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{ type: "text", text: `Tool error: ${message}` }],
+            isError: true
+          }
+        };
+      }
+    }
+    return {
+      jsonrpc: "2.0",
+      id,
+      error: { code: -32601, message: `Method not found: ${method}` }
+    };
+  }
+  listen(input = process.stdin, output = process.stdout, onExit) {
+    this.onDrainExit = onExit;
+    const maxFrameBytes = this.maxFrameBytes;
+    let buffer = Buffer.alloc(0);
+    let discardingOversizedLine = false;
+    const writeResponse = (payload, useContentLength) => {
+      const serialized = JSON.stringify(payload);
+      if (useContentLength) {
+        const len = Buffer.byteLength(serialized, "utf8");
+        output.write(`Content-Length: ${len}\r
+\r
+${serialized}`);
+      } else {
+        output.write(`${serialized}
+`);
+      }
+    };
+    this.sendToClient = (request, useContentLength) => writeResponse(request, useContentLength);
+    let drainExitCalled = false;
+    const triggerDrainExit = () => {
+      if (drainExitCalled) return;
+      drainExitCalled = true;
+      this.onDrainExit?.();
+    };
+    const dispatchRawJson = (jsonText, useContentLength) => {
+      let parsed;
+      try {
+        parsed = JSON.parse(jsonText);
+      } catch {
+        writeResponse(
+          {
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: -32700, message: "Parse error" }
+          },
+          useContentLength
+        );
+        return;
+      }
+      this.inFlight += 1;
+      const finish = () => {
+        this.inFlight -= 1;
+        if (this.stdinEnded && this.inFlight === 0) {
+          triggerDrainExit();
+        }
+      };
+      const outgoingForCall = [];
+      const flushOutgoingForCall = () => {
+        for (const task of outgoingForCall) {
+          task();
+        }
+      };
+      if (Array.isArray(parsed)) {
+        if (parsed.length === 0) {
+          writeResponse(
+            {
+              jsonrpc: "2.0",
+              id: null,
+              error: { code: -32600, message: "Invalid Request: empty batch" }
+            },
+            useContentLength
+          );
+          finish();
+          return;
+        }
+        const prevQueue2 = this.activeOutgoingQueue;
+        this.activeOutgoingQueue = outgoingForCall;
+        let promises;
+        try {
+          promises = parsed.map((item) => this.handleMessage(item, useContentLength));
+        } finally {
+          this.activeOutgoingQueue = prevQueue2;
+        }
+        const isInitOnlyBatch = parsed.some(
+          (item) => item !== null && typeof item === "object" && item.method === "initialize"
+        ) && !parsed.some(
+          (item) => item !== null && typeof item === "object" && item.method === "tools/call"
+        );
+        if (isInitOnlyBatch) {
+          this.initWriteInFlight += 1;
+        }
+        const releaseInitFlush = () => {
+          if (!isInitOnlyBatch) return;
+          this.initWriteInFlight = Math.max(0, this.initWriteInFlight - 1);
+          if (this.initWriteInFlight === 0 && this.postInitOutgoingQueue.length > 0) {
+            const queued = this.postInitOutgoingQueue.splice(0, this.postInitOutgoingQueue.length);
+            for (const task of queued) {
+              try {
+                task();
+              } catch {
+              }
+            }
+          }
+        };
+        void Promise.all(promises).then((responses) => {
+          const nonNull = responses.filter(
+            (r) => r !== null
+          );
+          if (nonNull.length > 0) {
+            writeResponse(nonNull, useContentLength);
+          }
+          flushOutgoingForCall();
+          releaseInitFlush();
+        }).catch(() => {
+          releaseInitFlush();
+        }).finally(finish);
+        return;
+      }
+      const isSingleInit = parsed !== null && typeof parsed === "object" && parsed.method === "initialize";
+      if (isSingleInit) {
+        this.initWriteInFlight += 1;
+      }
+      const releaseSingleInitFlush = () => {
+        if (!isSingleInit) return;
+        this.initWriteInFlight = Math.max(0, this.initWriteInFlight - 1);
+        if (this.initWriteInFlight === 0 && this.postInitOutgoingQueue.length > 0) {
+          const queued = this.postInitOutgoingQueue.splice(0, this.postInitOutgoingQueue.length);
+          for (const task of queued) {
+            try {
+              task();
+            } catch {
+            }
+          }
+        }
+      };
+      const prevQueue = this.activeOutgoingQueue;
+      this.activeOutgoingQueue = outgoingForCall;
+      let promise;
+      try {
+        promise = this.handleMessage(parsed, useContentLength);
+      } finally {
+        this.activeOutgoingQueue = prevQueue;
+      }
+      void promise.then((response) => {
+        if (response !== null) {
+          writeResponse(response, useContentLength);
+        }
+        flushOutgoingForCall();
+        releaseSingleInitFlush();
+      }).catch(() => {
+        releaseSingleInitFlush();
+      }).finally(finish);
+    };
+    const drainBuffer = () => {
+      while (buffer.length > 0) {
+        if (discardingOversizedLine) {
+          const nlIdx = buffer.indexOf(10);
+          if (nlIdx === -1) {
+            buffer = Buffer.alloc(0);
+            break;
+          }
+          discardingOversizedLine = false;
+          buffer = nlIdx + 1 >= buffer.length ? Buffer.alloc(0) : Buffer.from(buffer.subarray(nlIdx + 1));
+          continue;
+        }
+        let offset = 0;
+        while (offset < buffer.length && (buffer[offset] === 10 || buffer[offset] === 13)) {
+          offset++;
+        }
+        if (offset > 0) {
+          buffer = buffer.subarray(offset);
+          if (buffer.length === 0) break;
+        }
+        const headerProbe = buffer.subarray(0, 16).toString("latin1").toLowerCase();
+        if (headerProbe.startsWith("content-length:") || headerProbe.startsWith("content-type:")) {
+          const headerScan = buffer.subarray(0, Math.min(buffer.length, 16384)).toString("latin1");
+          const sepMatch = /\r?\n\r?\n/.exec(headerScan);
+          if (!sepMatch) {
+            if (buffer.length >= 16384) {
+              writeResponse(
+                {
+                  jsonrpc: "2.0",
+                  id: null,
+                  error: { code: -32600, message: "Invalid Request: header too large" }
+                },
+                true
+              );
+              buffer = Buffer.alloc(0);
+            }
+            break;
+          }
+          const sepIdx = sepMatch.index;
+          const sepLen = sepMatch[0].length;
+          const headerText = headerScan.slice(0, sepIdx);
+          const clMatches = [...headerText.matchAll(/^content-length:[ \t]*(\d+)[ \t]*\r?$/gim)];
+          if (clMatches.length !== 1) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: { code: -32600, message: "Invalid Request: invalid Content-Length header" }
+              },
+              true
+            );
+            buffer = buffer.subarray(sepIdx + sepLen);
+            continue;
+          }
+          const contentLength = Number(clMatches[0][1]);
+          if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > maxFrameBytes) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: { code: -32600, message: "Invalid Request: Content-Length out of bounds" }
+              },
+              true
+            );
+            buffer = Buffer.alloc(0);
+            break;
+          }
+          const bodyStart = sepIdx + sepLen;
+          if (buffer.length < bodyStart + contentLength) {
+            break;
+          }
+          const bodyText = buffer.subarray(bodyStart, bodyStart + contentLength).toString("utf8");
+          buffer = buffer.subarray(bodyStart + contentLength);
+          dispatchRawJson(bodyText, true);
+          continue;
+        }
+        const newlineIdx = buffer.indexOf(10);
+        if (newlineIdx === -1) {
+          const pendingLen = buffer.length > 0 && buffer[buffer.length - 1] === 13 ? buffer.length - 1 : buffer.length;
+          if (pendingLen > maxFrameBytes) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: {
+                  code: -32600,
+                  message: "Invalid Request: NDJSON message exceeds maximum allowed size"
+                }
+              },
+              false
+            );
+            discardingOversizedLine = true;
+            buffer = Buffer.alloc(0);
+          }
+          break;
+        }
+        const lineLen = newlineIdx > 0 && buffer[newlineIdx - 1] === 13 ? newlineIdx - 1 : newlineIdx;
+        if (lineLen > maxFrameBytes) {
+          writeResponse(
+            {
+              jsonrpc: "2.0",
+              id: null,
+              error: {
+                code: -32600,
+                message: "Invalid Request: NDJSON message exceeds maximum allowed size"
+              }
+            },
+            false
+          );
+          buffer = newlineIdx + 1 >= buffer.length ? Buffer.alloc(0) : Buffer.from(buffer.subarray(newlineIdx + 1));
+          continue;
+        }
+        const lineBuf = buffer.subarray(0, newlineIdx);
+        buffer = buffer.subarray(newlineIdx + 1);
+        const line = lineBuf.toString("utf8").trim();
+        if (line.length > 0) {
+          dispatchRawJson(line, false);
+        }
+      }
+    };
+    input.on("data", (chunk) => {
+      const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+      buffer = buffer.length === 0 ? buf : Buffer.concat([buffer, buf]);
+      drainBuffer();
+    });
+    const handleInputClosed = (flushTrailing) => {
+      if (this.stdinEnded) return;
+      const wasDiscarding = discardingOversizedLine;
+      discardingOversizedLine = false;
+      const remaining = flushTrailing && !wasDiscarding ? buffer.toString("utf8").trim() : "";
+      buffer = Buffer.alloc(0);
+      this.stdinEnded = true;
+      if (flushTrailing && remaining.length > 0) {
+        const lowerRem = remaining.toLowerCase();
+        if (!lowerRem.startsWith("content-length:") && !lowerRem.startsWith("content-type:")) {
+          dispatchRawJson(remaining, false);
+        }
+      }
+      this.settleAllPendingRoots();
+      if (this.inFlight === 0) {
+        triggerDrainExit();
+      }
+    };
+    input.on("end", () => handleInputClosed(true));
+    input.on("close", () => handleInputClosed(false));
+    input.on("error", () => handleInputClosed(false));
+  }
+};
+
+// src/utils/host-compat.ts
+import fs5 from "node:fs";
+import os3 from "node:os";
+import path6 from "node:path";
+var HOST_COMPAT_RULES = [
+  {
+    id: "agy-cli-1.5-call-mcp-tool-empty-edits",
+    surface: "cli",
+    minVersion: "1.5.0",
+    // Antigravity CLI >= 1.5.8 supports `"eager": true` in mcp_config.json,
+    // which registers typed native mcp_agy-fast_fast_* tools and bypasses
+    // lazy call_mcp_tool altogether (keeping token-saving native array edits).
+    // Pre-eager CLI 1.5.0-1.5.7 keeps the JSON-string workaround automatically;
+    // any lazy/custom setup can still opt in via AGY_FAST_EDITS_FORMAT=string.
+    maxVersionExclusive: "1.5.8",
+    editsFormat: "string",
+    reason: "Pre-eager Antigravity CLI 1.5.0-1.5.7 loads tools lazily via call_mcp_tool where long native edits arrays can drop to []; JSON array string avoids payload loss"
+  }
+];
+function parseHostSemverParts(raw) {
+  const m = /(?:^|[^0-9.])v?(\d+)\.(\d+)\.(\d+)(?:\.\d+)?(?:-([0-9A-Za-z.-]+))?(?:$|[^0-9.])/.exec(
+    raw.trim()
+  );
+  if (!m) return null;
+  const major = Number.parseInt(m[1], 10);
+  const minor = Number.parseInt(m[2], 10);
+  const patch = Number.parseInt(m[3], 10);
+  if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor) || !Number.isSafeInteger(patch) || major > 999999 || minor > 999999 || patch > 999999) {
+    return null;
+  }
+  return { major, minor, patch, prerelease: m[4] ?? null };
+}
+function formatHostSemverParts(parts) {
+  const base = `${parts.major}.${parts.minor}.${parts.patch}`;
+  return parts.prerelease ? `${base}-${parts.prerelease}` : base;
+}
+function comparePrerelease(a, b) {
+  const aParts = a.split(".");
+  const bParts = b.split(".");
+  const len = Math.max(aParts.length, bParts.length);
+  for (let i = 0; i < len; i++) {
+    const ai = aParts[i];
+    const bi = bParts[i];
+    if (ai === void 0) return -1;
+    if (bi === void 0) return 1;
+    if (ai === bi) continue;
+    const aNum = /^\d+$/.test(ai);
+    const bNum = /^\d+$/.test(bi);
+    if (aNum && bNum) {
+      const diff = Number.parseInt(ai, 10) - Number.parseInt(bi, 10);
+      if (diff !== 0) return diff > 0 ? 1 : -1;
+    } else if (aNum !== bNum) {
+      return aNum ? -1 : 1;
+    } else {
+      return ai < bi ? -1 : 1;
+    }
+  }
+  return 0;
+}
+function compareHostSemver(a, b) {
+  const pa = parseHostSemverParts(a);
+  const pb = parseHostSemverParts(b);
+  if (!pa || !pb) return a.localeCompare(b);
+  if (pa.major !== pb.major) return pa.major > pb.major ? 1 : -1;
+  if (pa.minor !== pb.minor) return pa.minor > pb.minor ? 1 : -1;
+  if (pa.patch !== pb.patch) return pa.patch > pb.patch ? 1 : -1;
+  if (pa.prerelease === pb.prerelease) return 0;
+  if (pa.prerelease === null) return 1;
+  if (pb.prerelease === null) return -1;
+  return comparePrerelease(pa.prerelease, pb.prerelease);
+}
+function parseEditsFormatMode(raw) {
+  if (typeof raw !== "string") return null;
+  const v = raw.trim().toLowerCase();
+  if (v === "auto" || v === "array" || v === "string") return v;
+  return null;
+}
+function parseHostOverride(raw) {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed) return null;
+  const m = /^(cli|desktop|app|antigravity|ide|unknown)(?:[@\-/\s](.+))?$/.exec(trimmed);
+  if (!m) return null;
+  const surface = m[1] === "app" || m[1] === "antigravity" ? "desktop" : m[1];
+  if (m[2] !== void 0) {
+    const parts = parseHostSemverParts(m[2]);
+    if (!parts) return null;
+    return { surface, version: formatHostSemverParts(parts) };
+  }
+  return { surface, version: null };
+}
+var EXPLICIT_THIRD_PARTY_CLIENT_RE = /^(?:claude(?:[-_\s]|$)|cursor(?:[-_\s]|$)|windsurf(?:[-_\s]|$)|vscode(?:[-_\s]|$)|visual[\s_-]+studio[\s_-]+code|codex(?:[-_\s]|$)|zed(?:[-_\s]|$)|cline(?:[-_\s]|$)|roo[-_\s]?code|continue(?:[-_\s]|$)|opencode(?:[-_\s]|$)|aider(?:[-_\s]|$)|goose(?:[-_\s]|$)|jetbrains(?:[-_\s]|$)|neovim(?:[-_\s]|$)|nvim(?:[-_\s]|$)|emacs(?:[-_\s]|$)|mcp[-_\s]?inspector(?:[-_\s]|$))/i;
+function isExplicitThirdPartyClient(rawName) {
+  if (typeof rawName !== "string") return false;
+  return EXPLICIT_THIRD_PARTY_CLIENT_RE.test(rawName.trim());
+}
+function parseSurfaceFromClientName(rawName) {
+  if (typeof rawName !== "string") return null;
+  const s = rawName.trim().toLowerCase();
+  if (!s || s.startsWith("agy-fast")) return null;
+  if (/^(?:google[-_\s]?)?antigravity[-_\s]?cli$/.test(s) || /^agy(?:[-_\s]?cli)?$/.test(s)) {
+    return "cli";
+  }
+  if (/^(?:google[-_\s]?)?antigravity[-_\s]?ide$/.test(s)) {
+    return "ide";
+  }
+  if (/^(?:google[-_\s]?)?antigravity(?:[-_\s]?(?:2\.0|app|desktop))?$/.test(s)) {
+    return "desktop";
+  }
+  return null;
+}
+function parseLsVersion(raw) {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const parts = parseHostSemverParts(trimmed);
+  const version = parts ? formatHostSemverParts(parts) : null;
+  if (/^(?:antigravity[-_\s]?)?cli(?:[-_/@\s]|$)/i.test(trimmed)) {
+    return { surface: "cli", version };
+  }
+  if (/^(?:antigravity[-_\s]?)?ide(?:[-_/@\s]|$)/i.test(trimmed)) {
+    return { surface: "ide", version };
+  }
+  if (/^(?:antigravity[-_\s]?)?(?:desktop|app)(?:[-_/@\s]|$)/i.test(trimmed)) {
+    return { surface: "desktop", version };
+  }
+  if (/^antigravity(?:[-_/@\s]|$)/i.test(trimmed)) {
+    return { surface: "desktop", version };
+  }
+  if (version) {
+    return { surface: null, version };
+  }
+  return null;
+}
+function parseSurfaceFromPath(rawPath, allowTrailingAppDir = false) {
+  if (typeof rawPath !== "string" || !rawPath.trim()) return null;
+  const segs = rawPath.trim().replace(/\\/g, "/").split("/").filter(Boolean).map((s) => s.toLowerCase());
+  for (let i = 0; i < segs.length - 1; i++) {
+    if (segs[i] !== ".gemini") continue;
+    const next = segs[i + 1];
+    if (next === "antigravity-cli") return "cli";
+    if (next === "antigravity-ide") return "ide";
+    if (next === "antigravity") return "desktop";
+  }
+  if (allowTrailingAppDir && segs.length > 0) {
+    const tail = segs[segs.length - 1];
+    if (tail === "antigravity-cli") return "cli";
+    if (tail === "antigravity-ide") return "ide";
+    if (tail === "antigravity") return "desktop";
+  }
+  return null;
+}
+function detectHostIdentity(signals = {}) {
+  const env = signals.env ?? process.env;
+  const rawClientName = typeof signals.clientInfo?.name === "string" && signals.clientInfo.name.trim() ? signals.clientInfo.name.trim() : void 0;
+  const rawClientVersion = typeof signals.clientInfo?.version === "string" && signals.clientInfo.version.trim() ? signals.clientInfo.version.trim() : void 0;
+  const modelName = typeof signals.modelName === "string" && signals.modelName.trim() ? signals.modelName.trim() : void 0;
+  const override = parseHostOverride(env.AGY_FAST_HOST);
+  if (override) {
+    return {
+      surface: override.surface,
+      version: override.version,
+      source: "override",
+      rawClientName,
+      rawClientVersion,
+      modelName
+    };
+  }
+  if (isExplicitThirdPartyClient(rawClientName)) {
+    return {
+      surface: "unknown",
+      version: null,
+      source: "mcp:client-info",
+      rawClientName,
+      rawClientVersion,
+      modelName
+    };
+  }
+  const clientSurface = parseSurfaceFromClientName(rawClientName);
+  const clientVerParts = clientSurface && rawClientVersion ? parseHostSemverParts(rawClientVersion) : null;
+  const clientVersion = clientVerParts ? formatHostSemverParts(clientVerParts) : null;
+  const hookSurface = parseSurfaceFromPath(signals.transcriptPath) ?? parseSurfaceFromPath(signals.artifactDirectoryPath);
+  const lsInfo = parseLsVersion(env.ANTIGRAVITY_LS_VERSION);
+  const appDataSurface = parseSurfaceFromPath(env.ANTIGRAVITY_APP_DATA_DIR, true);
+  let surface = "unknown";
+  let source = "unknown";
+  if (clientSurface) {
+    surface = clientSurface;
+    source = "mcp:client-info";
+  } else if (hookSurface) {
+    surface = hookSurface;
+    source = "hook:path";
+  } else if (lsInfo?.surface) {
+    surface = lsInfo.surface;
+    source = "env:ls-version";
+  } else if (appDataSurface) {
+    surface = appDataSurface;
+    source = "env:app-data-dir";
+  }
+  let version = null;
+  if (clientSurface === surface && clientVersion) {
+    version = clientVersion;
+  } else if (surface !== "unknown" && lsInfo?.version && (lsInfo.surface === null || lsInfo.surface === surface)) {
+    version = lsInfo.version;
+  }
+  return {
+    surface,
+    version,
+    source,
+    rawClientName,
+    rawClientVersion,
+    modelName
+  };
+}
+function ruleMatchesIdentity(rule, identity) {
+  if (rule.surface !== identity.surface) return false;
+  if (rule.minVersion !== void 0 || rule.maxVersionExclusive !== void 0) {
+    if (!identity.version) return false;
+    if (rule.minVersion !== void 0 && compareHostSemver(identity.version, rule.minVersion) < 0) {
+      return false;
+    }
+    if (rule.maxVersionExclusive !== void 0 && compareHostSemver(identity.version, rule.maxVersionExclusive) >= 0) {
+      return false;
+    }
+  }
+  return true;
+}
+function resolveHostCompat(signals = {}, rules = HOST_COMPAT_RULES) {
+  const env = signals.env ?? process.env;
+  const identity = detectHostIdentity(signals);
+  let ruleEditsFormat;
+  let callBudgetSec = MCP_CALL_BUDGET_SEC;
+  let inlineMaxBytes = DEFAULT_INLINE_MAX_BYTES;
+  const matchedRuleIds = [];
+  const reasons = [];
+  for (const rule of rules) {
+    if (!ruleMatchesIdentity(rule, identity)) continue;
+    matchedRuleIds.push(rule.id);
+    if (rule.editsFormat !== void 0) ruleEditsFormat = rule.editsFormat;
+    if (rule.callBudgetSec !== void 0) callBudgetSec = rule.callBudgetSec;
+    if (rule.inlineMaxBytes !== void 0) inlineMaxBytes = rule.inlineMaxBytes;
+    if (rule.reason) reasons.push(rule.reason);
+  }
+  const envMode = parseEditsFormatMode(env.AGY_FAST_EDITS_FORMAT);
+  const cfgMode = parseEditsFormatMode(signals.configEditsFormat);
+  let editsFormat = "array";
+  let editsFormatSource = "token-saving-default";
+  let reason = reasons[0] ?? "Defaulting to native array edits for lower output token usage (~2.6-3.3x cheaper than double-escaped JSON strings)";
+  if (envMode === "array" || envMode === "string") {
+    editsFormat = envMode;
+    editsFormatSource = "env-override";
+    reason = `Forced by AGY_FAST_EDITS_FORMAT=${envMode}`;
+  } else if (envMode !== "auto" && (cfgMode === "array" || cfgMode === "string")) {
+    editsFormat = cfgMode;
+    editsFormatSource = "config-override";
+    reason = `Configured in agy-fast config.json (editsFormat=${cfgMode})`;
+  } else if (ruleEditsFormat !== void 0) {
+    editsFormat = ruleEditsFormat;
+    editsFormatSource = "compat-rule";
+  }
+  return {
+    identity,
+    editsFormat,
+    editsFormatSource,
+    callBudgetSec,
+    inlineMaxBytes,
+    matchedRuleIds,
+    reason
+  };
+}
+function getConfigPath(env = process.env) {
+  const custom = env.AGY_FAST_CACHE_DIR?.trim();
+  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os3.homedir() : env.HOME || env.USERPROFILE || os3.homedir();
+  const cacheDir = custom ? path6.resolve(custom) : path6.join(home, ".gemini", "cache", "agy-fast");
+  return path6.join(cacheDir, "config.json");
+}
+function readSavedEditsFormatSync(env = process.env) {
+  try {
+    const raw = fs5.readFileSync(getConfigPath(env), "utf8");
+    const parsed = JSON.parse(raw);
+    return parseEditsFormatMode(parsed?.editsFormat) ?? void 0;
+  } catch {
+    return void 0;
+  }
+}
+
+// src/mcp-server-core.ts
 var SERVER_VERSION = "0.3.1";
 var DEFAULT_PLUGIN_ROOT = path7.resolve(
   path7.dirname(fileURLToPath2(import.meta.url)),
   ".."
 );
+var ALL_MCP_TOOLS = [
+  "batch_search",
+  "apply_edits",
+  "read_slices",
+  "quick_outline",
+  "run_checks"
+];
+var ALL_MCP_TOOL_SET = new Set(ALL_MCP_TOOLS);
+function parseToolFilter(raw, sourceLabel = "--tools") {
+  const parts = raw.split(",").map((s) => s.trim());
+  if (parts.length === 0 || parts.some((p) => p.length === 0)) {
+    throw new Error(
+      `Invalid ${sourceLabel} value "${raw}". Expected comma-separated tool names from: ${ALL_MCP_TOOLS.join(", ")}.`
+    );
+  }
+  const invalid = parts.filter((p) => !ALL_MCP_TOOL_SET.has(p));
+  if (invalid.length > 0) {
+    throw new Error(
+      `Unknown tool(s) in ${sourceLabel}: ${invalid.join(", ")}. Valid tools: ${ALL_MCP_TOOLS.join(", ")}.`
+    );
+  }
+  return new Set(parts);
+}
+function normalizeProvidedTools(tools) {
+  const list = [...tools];
+  if (list.length === 0) {
+    throw new Error(
+      `Invalid options.tools value (empty). Expected at least one tool from: ${ALL_MCP_TOOLS.join(", ")}.`
+    );
+  }
+  const invalid = list.filter((name) => !ALL_MCP_TOOL_SET.has(name));
+  if (invalid.length > 0) {
+    throw new Error(
+      `Unknown tool(s) in options.tools: ${invalid.join(", ")}. Valid tools: ${ALL_MCP_TOOLS.join(", ")}.`
+    );
+  }
+  return new Set(list);
+}
 var MINIMAL_SCHEMA_STRIPPED_KEYWORDS = /* @__PURE__ */ new Set([
   "minimum",
   "maximum",
@@ -10221,12 +10257,38 @@ function sanitizeSchemaToMinimalSubset(node) {
   }
   return out;
 }
-function parseMcpServerCliArgs(argv) {
+function parseMcpServerCliArgs(argv, env = process.env) {
   let schemaCompat;
+  let tools;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "-h" || arg === "--help") {
       return { ok: true, help: true };
+    }
+    if (arg === "--tools" || arg.startsWith("--tools=")) {
+      let rawTools;
+      if (arg.startsWith("--tools=")) {
+        rawTools = arg.slice("--tools=".length);
+      } else {
+        const next = argv[i + 1];
+        if (next === void 0 || next.startsWith("-")) {
+          return {
+            ok: false,
+            error: `Missing value after --tools. Valid tools: ${ALL_MCP_TOOLS.join(", ")}.`
+          };
+        }
+        rawTools = next;
+        i++;
+      }
+      try {
+        tools = parseToolFilter(rawTools, "--tools");
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err)
+        };
+      }
+      continue;
     }
     if (arg === "--schema-compat" || arg.startsWith("--schema-compat=")) {
       const rawValue = arg.startsWith("--schema-compat=") ? arg.slice("--schema-compat=".length) : argv[++i];
@@ -10251,7 +10313,34 @@ function parseMcpServerCliArgs(argv) {
       error: `Unknown argument ${JSON.stringify(arg)}. Run with --help for usage.`
     };
   }
-  return { ok: true, help: false, schemaCompat };
+  if (tools === void 0) {
+    const envTools = env.AGY_FAST_TOOLS?.trim();
+    if (envTools) {
+      try {
+        tools = parseToolFilter(envTools, "AGY_FAST_TOOLS");
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err)
+        };
+      }
+    }
+  }
+  return { ok: true, help: false, schemaCompat, tools };
+}
+function parseServerCliArgs(argv, env = process.env) {
+  const parsed = parseMcpServerCliArgs(argv, env);
+  if (!parsed.ok) {
+    throw new Error(parsed.error);
+  }
+  if (parsed.help) {
+    return { help: true };
+  }
+  return {
+    help: false,
+    schemaCompat: parsed.schemaCompat,
+    tools: parsed.tools
+  };
 }
 function printMcpServerHelp() {
   process.stdout.write(
@@ -10259,11 +10348,14 @@ function printMcpServerHelp() {
       "agy-fast MCP stdio server",
       "",
       "Usage:",
-      "  agy-fast-mcp [--schema-compat <standard|minimal>]",
-      "  agy-fast mcp [--schema-compat <standard|minimal>]",
+      "  agy-fast-mcp [--tools <tool1,tool2,...>] [--schema-compat <standard|minimal>]",
+      "  agy-fast mcp [--tools <tool1,tool2,...>] [--schema-compat <standard|minimal>]",
       "  agy-fast-mcp --cli <search|outline|slice|edit|check> [args...]",
       "",
       "Options:",
+      "  --tools <list>",
+      "      Comma-separated subset of MCP tools to expose",
+      `      (valid: ${ALL_MCP_TOOLS.join(", ")}; env: AGY_FAST_TOOLS).`,
       "  --schema-compat <standard|minimal>",
       "      Schema keyword profile for tools/list (env: AGY_FAST_SCHEMA_COMPAT).",
       "      'minimal' strips numeric/array range keywords (minimum/maximum/minItems/maxItems)",
@@ -10405,6 +10497,8 @@ function createAgyFastServer(options = {}) {
   const getProcessCwd = options.processCwd ?? (() => process.cwd());
   const scriptPluginRoot = options.pluginRoot ?? DEFAULT_PLUGIN_ROOT;
   const savedEditsFormat = options.configEditsFormat ?? readSavedEditsFormatSync(env);
+  const selectedTools = options.tools !== void 0 ? normalizeProvidedTools(options.tools) : void 0;
+  const shouldRegister = (name) => !selectedTools || selectedTools.has(name);
   const schemaCompat = options.schemaCompat ?? parseSchemaCompatMode(env.AGY_FAST_SCHEMA_COMPAT) ?? "standard";
   const applySchemaCompat = (def) => schemaCompat === "minimal" ? { ...def, inputSchema: sanitizeSchemaToMinimalSubset(def.inputSchema) } : def;
   let hostCompat = resolveHostCompat({
@@ -10511,174 +10605,186 @@ function createAgyFastServer(options = {}) {
       }
     }
   });
-  server.registerTool(
-    applySchemaCompat({
-      name: "batch_search",
-      description: "Parallel search: literal text, regex, fuzzy paths, glob (*/{a,b}, no |), read-only git. Absolute cwd if no roots/list (Desktop 2.0 Hub). path rel/abs file/dir; glob filters text/regex; fileType lang/ext (text/regex/fuzzy). multiline spans lines (dot too); count/file=lines or multiline occurrences. Defaults: outputMode=content, caseSensitive=true, contextLines=0, maxResults=40, maxChars=8500 (8800B UTF-8 max); glob sortBy=path (mtime newest).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          cwd: { type: "string" },
-          queries: {
-            type: "array",
-            minItems: 1,
-            maxItems: 20,
-            items: {
-              type: "object",
-              properties: {
-                type: {
-                  type: "string",
-                  enum: ["text", "regex", "glob", "fuzzy", "git"]
+  if (shouldRegister("batch_search")) {
+    server.registerTool(
+      applySchemaCompat({
+        name: "batch_search",
+        description: "Parallel search: literal text, regex, fuzzy paths, glob (*/{a,b}, no |), read-only git. Absolute cwd if no roots/list (Desktop 2.0 Hub). path rel/abs file/dir; glob filters text/regex; fileType lang/ext (text/regex/fuzzy). multiline spans lines (dot too); count/file=lines or multiline occurrences. Defaults: outputMode=content, caseSensitive=true, contextLines=0, maxResults=40, maxChars=8500 (8800B UTF-8 max); glob sortBy=path (mtime newest).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            cwd: { type: "string" },
+            queries: {
+              type: "array",
+              minItems: 1,
+              maxItems: 20,
+              items: {
+                type: "object",
+                properties: {
+                  type: {
+                    type: "string",
+                    enum: ["text", "regex", "glob", "fuzzy", "git"]
+                  },
+                  pattern: { type: "string" },
+                  path: { type: "string" },
+                  glob: { type: "string" },
+                  multiline: { type: "boolean" },
+                  outputMode: {
+                    type: "string",
+                    enum: ["content", "files_with_matches", "count"]
+                  },
+                  fileType: { type: "string" },
+                  sortBy: { type: "string", enum: ["path", "mtime"] },
+                  caseSensitive: { type: "boolean" },
+                  contextLines: { type: "integer", minimum: 0, maximum: 10 },
+                  maxResults: { type: "integer", minimum: 1, maximum: 200 }
                 },
-                pattern: { type: "string" },
-                path: { type: "string" },
-                glob: { type: "string" },
-                multiline: { type: "boolean" },
-                outputMode: {
-                  type: "string",
-                  enum: ["content", "files_with_matches", "count"]
-                },
-                fileType: { type: "string" },
-                sortBy: { type: "string", enum: ["path", "mtime"] },
-                caseSensitive: { type: "boolean" },
-                contextLines: { type: "integer", minimum: 0, maximum: 10 },
-                maxResults: { type: "integer", minimum: 1, maximum: 200 }
-              },
-              required: ["type", "pattern"]
-            }
+                required: ["type", "pattern"]
+              }
+            },
+            maxChars: { type: "integer", minimum: 500, maximum: 8800 }
           },
-          maxChars: { type: "integer", minimum: 500, maximum: 8800 }
-        },
-        required: ["queries"]
-      }
-    }),
-    async (args) => {
-      const resolved = resolveToolArgs(args);
-      if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runBatchSearch(resolved.value);
-    }
-  );
-  server.registerTool(
-    () => applySchemaCompat(buildApplyEditsToolDefinition(hostCompat)),
-    async (args) => {
-      const resolved = resolveToolArgs(args);
-      if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runApplyEdits(resolved.value);
-    }
-  );
-  server.registerTool(
-    applySchemaCompat({
-      name: "read_slices",
-      description: "Batch outlines (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) + tiny <=120-line slices. For >150 known lines total, prefer parallel read_file(StartLine, EndLine) if available (agy: 46KB/call, no remote check). Absolute cwd if no roots/list (Desktop 2.0 Hub). slices: 1-based inclusive [start,end]; lineRanges: 'path:start-end,s2-e2'. maxChars default 8500; 8800 UTF-8 bytes total.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          cwd: { type: "string" },
-          outlines: {
-            type: "array",
-            maxItems: 40,
-            items: { type: "string" }
-          },
-          slices: {
-            type: "array",
-            maxItems: 30,
-            items: {
-              type: "object",
-              properties: {
-                path: { type: "string" },
-                ranges: {
-                  type: "array",
-                  minItems: 1,
-                  items: {
-                    type: "array",
-                    minItems: 2,
-                    maxItems: 2,
-                    items: { type: "integer", minimum: 1 }
-                  }
-                }
-              },
-              required: ["path", "ranges"]
-            }
-          },
-          lineRanges: {
-            type: "array",
-            maxItems: 30,
-            items: { type: "string" }
-          },
-          maxChars: { type: "integer", minimum: 1e3, maximum: 8800 }
+          required: ["queries"]
         }
+      }),
+      async (args) => {
+        const resolved = resolveToolArgs(args);
+        if (!resolved.ok) return { text: resolved.error, isError: true };
+        return runBatchSearch(resolved.value);
       }
-    }),
-    async (args) => {
-      const resolved = resolveToolArgs(args);
-      if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runReadSlices(resolved.value);
-    }
-  );
-  server.registerTool(
-    applySchemaCompat({
-      name: "quick_outline",
-      description: "Fast symbol/section line-range outlines for large files (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) before parallel ranged read_file(StartLine, EndLine). Flat paths-only schema. Absolute cwd if no roots/list (Desktop 2.0 Hub). maxChars default 8500; 8800 UTF-8 bytes total.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          cwd: { type: "string" },
-          paths: {
-            type: "array",
-            minItems: 1,
-            maxItems: 40,
-            items: { type: "string" }
+    );
+  }
+  if (shouldRegister("apply_edits")) {
+    server.registerTool(
+      () => applySchemaCompat(buildApplyEditsToolDefinition(hostCompat)),
+      async (args) => {
+        const resolved = resolveToolArgs(args);
+        if (!resolved.ok) return { text: resolved.error, isError: true };
+        return runApplyEdits(resolved.value);
+      }
+    );
+  }
+  if (shouldRegister("read_slices")) {
+    server.registerTool(
+      applySchemaCompat({
+        name: "read_slices",
+        description: "Batch outlines (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) + tiny <=120-line slices. For >150 known lines total, prefer parallel read_file(StartLine, EndLine) if available (agy: 46KB/call, no remote check). Absolute cwd if no roots/list (Desktop 2.0 Hub). slices: 1-based inclusive [start,end]; lineRanges: 'path:start-end,s2-e2'. maxChars default 8500; 8800 UTF-8 bytes total.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            cwd: { type: "string" },
+            outlines: {
+              type: "array",
+              maxItems: 40,
+              items: { type: "string" }
+            },
+            slices: {
+              type: "array",
+              maxItems: 30,
+              items: {
+                type: "object",
+                properties: {
+                  path: { type: "string" },
+                  ranges: {
+                    type: "array",
+                    minItems: 1,
+                    items: {
+                      type: "array",
+                      minItems: 2,
+                      maxItems: 2,
+                      items: { type: "integer", minimum: 1 }
+                    }
+                  }
+                },
+                required: ["path", "ranges"]
+              }
+            },
+            lineRanges: {
+              type: "array",
+              maxItems: 30,
+              items: { type: "string" }
+            },
+            maxChars: { type: "integer", minimum: 1e3, maximum: 8800 }
+          }
+        }
+      }),
+      async (args) => {
+        const resolved = resolveToolArgs(args);
+        if (!resolved.ok) return { text: resolved.error, isError: true };
+        return runReadSlices(resolved.value);
+      }
+    );
+  }
+  if (shouldRegister("quick_outline")) {
+    server.registerTool(
+      applySchemaCompat({
+        name: "quick_outline",
+        description: "Fast symbol/section line-range outlines for large files (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) before parallel ranged read_file(StartLine, EndLine). Flat paths-only schema. Absolute cwd if no roots/list (Desktop 2.0 Hub). maxChars default 8500; 8800 UTF-8 bytes total.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            cwd: { type: "string" },
+            paths: {
+              type: "array",
+              minItems: 1,
+              maxItems: 40,
+              items: { type: "string" }
+            },
+            maxChars: { type: "integer", minimum: 1e3, maximum: 8800 }
           },
-          maxChars: { type: "integer", minimum: 1e3, maximum: 8800 }
-        },
-        required: ["paths"]
+          required: ["paths"]
+        }
+      }),
+      async (args) => {
+        const resolved = resolveToolArgs(args);
+        if (!resolved.ok) return { text: resolved.error, isError: true };
+        return runQuickOutline(resolved.value);
       }
-    }),
-    async (args) => {
-      const resolved = resolveToolArgs(args);
-      if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runQuickOutline(resolved.value);
-    }
-  );
-  server.registerTool(
-    applySchemaCompat({
-      name: "run_checks",
-      description: `Batch >=2 independent non-interactive shell commands concurrently (for 1 lightweight command, prefer run_command). outputMode 'compact' (default) hides pass logs, keeps failures; 'full' keeps passing stdout. concurrency default 4. Per-cmd timeoutSec default 60; shared ${MCP_CALL_BUDGET_SEC}s budget (agy drops results at 180s; commands that cannot start are marked not run). Absolute cwd if no roots/list (Desktop 2.0 Hub); command.cwd overrides; name is label. maxChars default 8000; 8800 UTF-8 bytes total.`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          cwd: { type: "string" },
-          commands: {
-            type: "array",
-            minItems: 1,
-            maxItems: 12,
-            items: {
-              type: "object",
-              properties: {
-                name: { type: "string" },
-                command: { type: "string" },
-                cwd: { type: "string" },
-                timeoutSec: { type: "integer", minimum: 1, maximum: MCP_CALL_BUDGET_SEC }
-              },
-              required: ["command"]
-            }
+    );
+  }
+  if (shouldRegister("run_checks")) {
+    server.registerTool(
+      applySchemaCompat({
+        name: "run_checks",
+        description: `Batch >=2 independent non-interactive shell commands concurrently (for 1 lightweight command, prefer run_command). outputMode 'compact' (default) hides pass logs, keeps failures; 'full' keeps passing stdout. concurrency default 4. Per-cmd timeoutSec default 60; shared ${MCP_CALL_BUDGET_SEC}s budget (agy drops results at 180s; commands that cannot start are marked not run). Absolute cwd if no roots/list (Desktop 2.0 Hub); command.cwd overrides; name is label. maxChars default 8000; 8800 UTF-8 bytes total.`,
+        inputSchema: {
+          type: "object",
+          properties: {
+            cwd: { type: "string" },
+            commands: {
+              type: "array",
+              minItems: 1,
+              maxItems: 12,
+              items: {
+                type: "object",
+                properties: {
+                  name: { type: "string" },
+                  command: { type: "string" },
+                  cwd: { type: "string" },
+                  timeoutSec: { type: "integer", minimum: 1, maximum: MCP_CALL_BUDGET_SEC }
+                },
+                required: ["command"]
+              }
+            },
+            concurrency: { type: "integer", minimum: 1, maximum: 8 },
+            timeoutSec: { type: "integer", minimum: 1, maximum: MCP_CALL_BUDGET_SEC },
+            outputMode: { type: "string", enum: ["compact", "full"] },
+            maxChars: { type: "integer", minimum: 500, maximum: 8800 }
           },
-          concurrency: { type: "integer", minimum: 1, maximum: 8 },
-          timeoutSec: { type: "integer", minimum: 1, maximum: MCP_CALL_BUDGET_SEC },
-          outputMode: { type: "string", enum: ["compact", "full"] },
-          maxChars: { type: "integer", minimum: 500, maximum: 8800 }
-        },
-        required: ["commands"]
+          required: ["commands"]
+        }
+      }),
+      async (args) => {
+        const resolved = resolveToolArgs(args);
+        if (!resolved.ok) return { text: resolved.error, isError: true };
+        return runChecks(resolved.value);
       }
-    }),
-    async (args) => {
-      const resolved = resolveToolArgs(args);
-      if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runChecks(resolved.value);
-    }
-  );
+    );
+  }
   return server;
 }
+
+// src/mcp-server.ts
 function main() {
   if (process.argv[2] === "--cli") {
     void runAgyFastCli(process.argv.slice(3)).then((code) => {
@@ -10692,7 +10798,7 @@ function main() {
     });
     return;
   }
-  const cliParsed = parseMcpServerCliArgs(process.argv.slice(2));
+  const cliParsed = parseMcpServerCliArgs(process.argv.slice(2), process.env);
   if (!cliParsed.ok) {
     process.stderr.write(`Error: ${cliParsed.error}
 `);
@@ -10703,7 +10809,10 @@ function main() {
     printMcpServerHelp();
     return;
   }
-  const server = createAgyFastServer({ schemaCompat: cliParsed.schemaCompat });
+  const server = createAgyFastServer({
+    schemaCompat: cliParsed.schemaCompat,
+    tools: cliParsed.tools
+  });
   let flushing = false;
   const exitImmediately = () => {
     process.exit(0);
@@ -10737,8 +10846,12 @@ function main() {
 }
 main();
 export {
+  ALL_MCP_TOOLS,
   createAgyFastServer,
   parseMcpServerCliArgs,
   parseSchemaCompatMode,
+  parseServerCliArgs,
+  parseToolFilter,
+  printMcpServerHelp,
   sanitizeSchemaToMinimalSubset
 };

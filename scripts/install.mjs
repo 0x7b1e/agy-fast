@@ -474,10 +474,13 @@ async function removeTargetPath(targetPath, stat, { quiet = false } = {}) {
 }
 
 async function verifyMcpServerLive(mcpScriptPath) {
+  const cleanMcpEnv = { ...process.env };
+  delete cleanMcpEnv.AGY_FAST_TOOLS;
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [mcpScriptPath], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+      env: cleanMcpEnv,
     });
 
     let stdout = "";

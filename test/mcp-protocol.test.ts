@@ -7,6 +7,7 @@ import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { after, before, describe, it } from "node:test";
 import { MAX_FRAME_BYTES, McpStdioServer } from "../src/protocol/mcp.js";
+import { createAgyFastServer } from "../src/mcp-server-core.js";
 
 const MCP_SERVER_SCRIPT = path.resolve(process.cwd(), "dist", "mcp-server.mjs");
 
@@ -19,6 +20,7 @@ function buildCleanServerEnv(
   delete env.AGY_FAST_HOST;
   delete env.AGY_FAST_EDITS_FORMAT;
   delete env.AGY_FAST_SCHEMA_COMPAT;
+  delete env.AGY_FAST_TOOLS;
   delete env.AGY_FAST_CACHE_DIR;
   delete env.PLUGIN_ROOT;
   delete env.AGY_PLUGIN_ROOT;
@@ -1453,5 +1455,106 @@ describe("MCP Stdio Server end-to-end", () => {
       serverBuf.byteLength <= MAX_MCP_BUNDLE_BYTES,
       `dist/mcp-server.mjs is ${serverBuf.byteLength} bytes, exceeding ${MAX_MCP_BUNDLE_BYTES}-byte anti-bloat budget`,
     );
+  });
+
+  it("filters registered MCP tools via --tools and AGY_FAST_TOOLS and rejects invalid tool names", async () => {
+    const runWithArgs = (
+      cliArgs: string[],
+      rawChunks: string[],
+      extraEnv: Record<string, string | undefined> = {},
+    ): Promise<{ code: number | null; stdout: string; stderr: string }> =>
+      new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [MCP_SERVER_SCRIPT, ...cliArgs], {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: buildCleanServerEnv(extraEnv),
+          windowsHide: true,
+        });
+        let stdout = "";
+        let stderr = "";
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error(`runWithArgs timed out for args: ${cliArgs.join(" ")}`));
+        }, 6_000);
+        timer.unref();
+        child.stdout.on("data", (d) => {
+          stdout += d.toString("utf8");
+        });
+        child.stderr.on("data", (d) => {
+          stderr += d.toString("utf8");
+        });
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          resolve({ code, stdout, stderr });
+        });
+        for (const chunk of rawChunks) child.stdin.write(chunk);
+        child.stdin.end();
+      });
+
+    const listReq = [
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "codex", version: "1.0.0" } },
+      })}\n`,
+      `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`,
+      `${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`,
+      `${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "apply_edits", arguments: { edits: [] } } })}\n`,
+    ];
+
+    // 1. --tools comma-separated subset exposes only selected tools and rejects excluded tool calls
+    const subsetRes = await runWithArgs(["--tools", "batch_search,quick_outline,run_checks"], listReq);
+    assert.equal(subsetRes.code, 0, subsetRes.stderr);
+    const subsetLines = subsetRes.stdout.trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    const toolsList = ((subsetLines[1]!.result as { tools: Array<{ name: string }> }).tools).map((t) => t.name);
+    assert.deepEqual(toolsList, ["batch_search", "quick_outline", "run_checks"]);
+    const excludedCallErr = subsetLines[2]!.error as { code: number; message: string };
+    assert.equal(excludedCallErr.code, -32602);
+    assert.match(excludedCallErr.message, /Unknown tool/i);
+
+    // 2. AGY_FAST_TOOLS env var fallback works and --tools=... overrides it
+    const envRes = await runWithArgs([], listReq.slice(0, 3), { AGY_FAST_TOOLS: "quick_outline,run_checks" });
+    assert.equal(envRes.code, 0, envRes.stderr);
+    const envLines = envRes.stdout.trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    assert.deepEqual(
+      ((envLines[1]!.result as { tools: Array<{ name: string }> }).tools).map((t) => t.name),
+      ["quick_outline", "run_checks"],
+    );
+
+    const overrideRes = await runWithArgs(["--tools=batch_search"], listReq.slice(0, 3), { AGY_FAST_TOOLS: "run_checks" });
+    assert.equal(overrideRes.code, 0, overrideRes.stderr);
+    const overrideLines = overrideRes.stdout.trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    assert.deepEqual(
+      ((overrideLines[1]!.result as { tools: Array<{ name: string }> }).tools).map((t) => t.name),
+      ["batch_search"],
+    );
+
+    // 3. Invalid tool name, empty --tools, missing --tools value, duplicate invalid --tools, unknown flags, or extra args fail fast
+    for (const badArgs of [
+      ["--tools", "not_a_tool"],
+      ["--tools="],
+      ["--tools"],
+      ["--tools", "bogus", "--tools", "batch_search"],
+      ["--tool=batch_search"],
+      ["--tools", "batch_search", "quick_outline"],
+      ["--tools=batch_search", "--cli", "search", "foo"],
+    ]) {
+      const badRes = await runWithArgs(badArgs, []);
+      assert.equal(badRes.code, 1, `Expected exit 1 for ${badArgs.join(" ")}`);
+      assert.ok(badRes.stderr.length > 0);
+    }
+
+    // 4. --help succeeds even when AGY_FAST_TOOLS is invalid
+    const helpRes = await runWithArgs(["--help"], [], { AGY_FAST_TOOLS: "bogus" });
+    assert.equal(helpRes.code, 0, helpRes.stderr);
+    assert.match(helpRes.stdout, /--tools/);
+
+    // 5. Programmatic createAgyFastServer({ tools }) validates empty/unknown entries
+    assert.throws(() => createAgyFastServer({ tools: [] }), /empty/i);
+    assert.throws(() => createAgyFastServer({ tools: ["bogus" as never] }), /Unknown tool/i);
   });
 });
