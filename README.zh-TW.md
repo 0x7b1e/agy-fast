@@ -256,6 +256,7 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | **配置自動更新策略** *（`auto` \| `notify` \| `off`）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --auto-update notify --interval 24` |
 | **切換 MCP 工具載入模式** *（`eager` \| `lazy`，自動更新保留）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --tool-loading lazy` |
 | **CLI 直調模式** *（供 Swarm Worker 及無 MCP 環境通過 `run_command` 呼叫）* | `node ~/.gemini/config/plugins/agy-fast/dist/mcp-server.mjs --cli <search\|outline\|slice\|edit\|check>` |
+| **獨立 MCP Stdio 服務** *（供標準 MCP 用戶端按需掛載；透傳 `--schema-compat=minimal` 等參數）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs mcp` *（或 `agy-fast-mcp`）* |
 | **一鍵乾淨解除安裝** | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs uninstall` |
 
 > 在本機複製目錄中，也可直接使用 `./install.sh <子指令>`（macOS/Linux）或 `.\install.ps1 <子指令>`（Windows）執行上述全部子指令。
@@ -274,9 +275,10 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | `AGY_FAST_AUTO_UPDATE` | `auto` *（預設）* \| `notify` \| `off` | 覆蓋已儲存的自動更新模式 |
 | `AGY_FAST_UPDATE_INTERVAL_HOURS` | `12` *（預設；`1..720`）* | 背景檢查間隔（小時） |
 | `AGY_FAST_UPDATE_CHANNEL` | `release` *（預設）* \| `main` | 跟蹤穩定發版標籤或 `main` 分支 |
-| `AGY_FAST_REPO` | Git 儲存庫網址 | 自訂映像或 Fork 儲存庫網址 |
+| `AGY_FAST_REPO` | Git 儲存庫網址 | 自訂鏡像或 Fork 儲存庫網址 |
 | `AGY_FAST_EDITS_FORMAT` | `auto` *（預設）* \| `array` \| `string` | 控制 `apply_edits.edits` 參數格式策略（`auto` 在支援 `"eager": true` 的 CLI ≥1.5.8、桌面版 2.0、IDE 與第三方用戶端統一走省 token 的強型別原生陣列，在舊版懶載入 CLI 1.5.0–1.5.7 自動切換為 JSON 陣列字串以防 `[]` 丟參；伺服器端一律相容兩種格式） |
 | `AGY_FAST_HOST` | 如 `cli@1.5.14`、`ide@2.7.0`、`desktop@2.34.0` | 手動覆蓋自動探測到的 Antigravity 宿主端型別與版本 |
+| `AGY_FAST_SCHEMA_COMPAT` | `standard` *（預設）* \| `minimal` | 從 `tools/list` 剝離數值/陣列範圍約束關鍵字（`minimum`/`maximum`/`minItems`/`maxItems`），配合嚴格 JSON Schema 子集宿主（亦支援 `--schema-compat=minimal`，執行期校驗不受影響） |
 
 **更新生效提示：** 新版 `rules/AGENTS.md` 與 `dist/session-start.mjs` 在下一次開啟新工作階段時自動生效；Antigravity Desktop 2.0 / IDE 若需立即重新整理常駐 MCP 伺服器，重新載入視窗或重啟一次即可。
 

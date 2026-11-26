@@ -777,4 +777,71 @@ describe("installer", () => {
       await fs.rm(busyHome, { recursive: true, force: true }).catch(() => {});
     }
   });
+
+  it("starts standalone MCP server and forwards flags cleanly via 'mcp' subcommand", async () => {
+    const mcpResult = await new Promise<{ code: number | null; stdout: string; stderr: string }>(
+      (resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [INSTALL_SCRIPT, "mcp", "--schema-compat=minimal"],
+          {
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+            env: makeIsolatedEnv(fakeHome),
+          },
+        );
+        let stdout = "";
+        let stderr = "";
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error("install.mjs mcp timed out"));
+        }, 10_000);
+        timer.unref();
+        child.stdout.on("data", (d) => (stdout += d.toString("utf8")));
+        child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          resolve({ code, stdout, stderr });
+        });
+        child.stdin.write(
+          `${JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: { protocolVersion: "2025-03-26", capabilities: {} },
+          })}\n${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`,
+        );
+        child.stdin.end();
+      },
+    );
+
+    assert.equal(mcpResult.code, 0, mcpResult.stderr);
+    assert.equal(mcpResult.stderr, "");
+    const responses = mcpResult.stdout
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(responses.length, 2);
+    const tools = responses[1].result.tools as Array<{
+      name: string;
+      inputSchema: Record<string, unknown>;
+    }>;
+    assert.equal(tools.length, 5);
+    assert.equal(
+      JSON.stringify(tools).includes('"minimum"'),
+      false,
+      "forwarded --schema-compat=minimal must strip minimum constraints",
+    );
+
+    const cliOut = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "mcp", "--cli", "outline", "package.json"],
+      { env: makeIsolatedEnv(fakeHome), encoding: "utf8" },
+    );
+    assert.match(cliOut, /package\.json/);
+  });
 });

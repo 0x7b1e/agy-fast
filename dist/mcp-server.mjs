@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // agy-fast MCP Stdio Server (bundled zero-dependency ESM)
 
 
@@ -10176,6 +10177,103 @@ var DEFAULT_PLUGIN_ROOT = path7.resolve(
   path7.dirname(fileURLToPath2(import.meta.url)),
   ".."
 );
+var MINIMAL_SCHEMA_STRIPPED_KEYWORDS = /* @__PURE__ */ new Set([
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "minItems",
+  "maxItems",
+  "minLength",
+  "maxLength",
+  "pattern",
+  "multipleOf"
+]);
+function parseSchemaCompatMode(raw) {
+  if (typeof raw !== "string") return null;
+  const v = raw.trim().toLowerCase();
+  if (v === "standard" || v === "minimal") return v;
+  return null;
+}
+function sanitizeSchemaToMinimalSubset(node) {
+  const out = {};
+  for (const [key, value] of Object.entries(node)) {
+    if (MINIMAL_SCHEMA_STRIPPED_KEYWORDS.has(key)) continue;
+    if (key === "properties" && value !== null && typeof value === "object" && !Array.isArray(value)) {
+      const props = {};
+      for (const [propName, propSchema] of Object.entries(
+        value
+      )) {
+        props[propName] = propSchema !== null && typeof propSchema === "object" && !Array.isArray(propSchema) ? sanitizeSchemaToMinimalSubset(propSchema) : propSchema;
+      }
+      out.properties = props;
+    } else if (key === "items" && value !== null && typeof value === "object" && !Array.isArray(value)) {
+      out.items = sanitizeSchemaToMinimalSubset(value);
+    } else if (Array.isArray(value)) {
+      out[key] = value.map(
+        (item) => item !== null && typeof item === "object" && !Array.isArray(item) ? sanitizeSchemaToMinimalSubset(item) : item
+      );
+    } else if (value !== null && typeof value === "object") {
+      out[key] = sanitizeSchemaToMinimalSubset(value);
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+function parseMcpServerCliArgs(argv) {
+  let schemaCompat;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "-h" || arg === "--help") {
+      return { ok: true, help: true };
+    }
+    if (arg === "--schema-compat" || arg.startsWith("--schema-compat=")) {
+      const rawValue = arg.startsWith("--schema-compat=") ? arg.slice("--schema-compat=".length) : argv[++i];
+      if (rawValue === void 0 || !rawValue.trim()) {
+        return {
+          ok: false,
+          error: "Missing value for --schema-compat (expected: standard | minimal)."
+        };
+      }
+      const parsed = parseSchemaCompatMode(rawValue);
+      if (!parsed) {
+        return {
+          ok: false,
+          error: `Invalid --schema-compat value ${JSON.stringify(rawValue)} (expected: standard | minimal).`
+        };
+      }
+      schemaCompat = parsed;
+      continue;
+    }
+    return {
+      ok: false,
+      error: `Unknown argument ${JSON.stringify(arg)}. Run with --help for usage.`
+    };
+  }
+  return { ok: true, help: false, schemaCompat };
+}
+function printMcpServerHelp() {
+  process.stdout.write(
+    [
+      "agy-fast MCP stdio server",
+      "",
+      "Usage:",
+      "  agy-fast-mcp [--schema-compat <standard|minimal>]",
+      "  agy-fast mcp [--schema-compat <standard|minimal>]",
+      "  agy-fast-mcp --cli <search|outline|slice|edit|check> [args...]",
+      "",
+      "Options:",
+      "  --schema-compat <standard|minimal>",
+      "      Schema keyword profile for tools/list (env: AGY_FAST_SCHEMA_COMPAT).",
+      "      'minimal' strips numeric/array range keywords (minimum/maximum/minItems/maxItems)",
+      "      for strict JSON Schema subset hosts while keeping all runtime checks intact.",
+      "  -h, --help",
+      "      Show this help message.",
+      ""
+    ].join("\n")
+  );
+}
 function canonicalizeDir(dirPath) {
   const resolved = path7.resolve(dirPath);
   try {
@@ -10307,6 +10405,8 @@ function createAgyFastServer(options = {}) {
   const getProcessCwd = options.processCwd ?? (() => process.cwd());
   const scriptPluginRoot = options.pluginRoot ?? DEFAULT_PLUGIN_ROOT;
   const savedEditsFormat = options.configEditsFormat ?? readSavedEditsFormatSync(env);
+  const schemaCompat = options.schemaCompat ?? parseSchemaCompatMode(env.AGY_FAST_SCHEMA_COMPAT) ?? "standard";
+  const applySchemaCompat = (def) => schemaCompat === "minimal" ? { ...def, inputSchema: sanitizeSchemaToMinimalSubset(def.inputSchema) } : def;
   let hostCompat = resolveHostCompat({
     env,
     configEditsFormat: savedEditsFormat
@@ -10412,7 +10512,7 @@ function createAgyFastServer(options = {}) {
     }
   });
   server.registerTool(
-    {
+    applySchemaCompat({
       name: "batch_search",
       description: "Parallel search: literal text, regex, fuzzy paths, glob (*/{a,b}, no |), read-only git. Absolute cwd if no roots/list (Desktop 2.0 Hub). path rel/abs file/dir; glob filters text/regex; fileType lang/ext (text/regex/fuzzy). multiline spans lines (dot too); count/file=lines or multiline occurrences. Defaults: outputMode=content, caseSensitive=true, contextLines=0, maxResults=40, maxChars=8500 (8800B UTF-8 max); glob sortBy=path (mtime newest).",
       inputSchema: {
@@ -10451,7 +10551,7 @@ function createAgyFastServer(options = {}) {
         },
         required: ["queries"]
       }
-    },
+    }),
     async (args) => {
       const resolved = resolveToolArgs(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
@@ -10459,7 +10559,7 @@ function createAgyFastServer(options = {}) {
     }
   );
   server.registerTool(
-    () => buildApplyEditsToolDefinition(hostCompat),
+    () => applySchemaCompat(buildApplyEditsToolDefinition(hostCompat)),
     async (args) => {
       const resolved = resolveToolArgs(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
@@ -10467,7 +10567,7 @@ function createAgyFastServer(options = {}) {
     }
   );
   server.registerTool(
-    {
+    applySchemaCompat({
       name: "read_slices",
       description: "Batch outlines (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) + tiny <=120-line slices. For >150 known lines total, prefer parallel read_file(StartLine, EndLine) if available (agy: 46KB/call, no remote check). Absolute cwd if no roots/list (Desktop 2.0 Hub). slices: 1-based inclusive [start,end]; lineRanges: 'path:start-end,s2-e2'. maxChars default 8500; 8800 UTF-8 bytes total.",
       inputSchema: {
@@ -10508,7 +10608,7 @@ function createAgyFastServer(options = {}) {
           maxChars: { type: "integer", minimum: 1e3, maximum: 8800 }
         }
       }
-    },
+    }),
     async (args) => {
       const resolved = resolveToolArgs(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
@@ -10516,7 +10616,7 @@ function createAgyFastServer(options = {}) {
     }
   );
   server.registerTool(
-    {
+    applySchemaCompat({
       name: "quick_outline",
       description: "Fast symbol/section line-range outlines for large files (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) before parallel ranged read_file(StartLine, EndLine). Flat paths-only schema. Absolute cwd if no roots/list (Desktop 2.0 Hub). maxChars default 8500; 8800 UTF-8 bytes total.",
       inputSchema: {
@@ -10533,7 +10633,7 @@ function createAgyFastServer(options = {}) {
         },
         required: ["paths"]
       }
-    },
+    }),
     async (args) => {
       const resolved = resolveToolArgs(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
@@ -10541,7 +10641,7 @@ function createAgyFastServer(options = {}) {
     }
   );
   server.registerTool(
-    {
+    applySchemaCompat({
       name: "run_checks",
       description: `Batch >=2 independent non-interactive shell commands concurrently (for 1 lightweight command, prefer run_command). outputMode 'compact' (default) hides pass logs, keeps failures; 'full' keeps passing stdout. concurrency default 4. Per-cmd timeoutSec default 60; shared ${MCP_CALL_BUDGET_SEC}s budget (agy drops results at 180s; commands that cannot start are marked not run). Absolute cwd if no roots/list (Desktop 2.0 Hub); command.cwd overrides; name is label. maxChars default 8000; 8800 UTF-8 bytes total.`,
       inputSchema: {
@@ -10570,7 +10670,7 @@ function createAgyFastServer(options = {}) {
         },
         required: ["commands"]
       }
-    },
+    }),
     async (args) => {
       const resolved = resolveToolArgs(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
@@ -10592,7 +10692,18 @@ function main() {
     });
     return;
   }
-  const server = createAgyFastServer();
+  const cliParsed = parseMcpServerCliArgs(process.argv.slice(2));
+  if (!cliParsed.ok) {
+    process.stderr.write(`Error: ${cliParsed.error}
+`);
+    process.exitCode = 1;
+    return;
+  }
+  if (cliParsed.help) {
+    printMcpServerHelp();
+    return;
+  }
+  const server = createAgyFastServer({ schemaCompat: cliParsed.schemaCompat });
   let flushing = false;
   const exitImmediately = () => {
     process.exit(0);
@@ -10626,5 +10737,8 @@ function main() {
 }
 main();
 export {
-  createAgyFastServer
+  createAgyFastServer,
+  parseMcpServerCliArgs,
+  parseSchemaCompatMode,
+  sanitizeSchemaToMinimalSubset
 };

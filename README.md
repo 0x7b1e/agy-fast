@@ -258,6 +258,7 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 | **Configure auto-update** *(`auto` \| `notify` \| `off`)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --auto-update notify --interval 24` |
 | **Switch MCP tool loading** *(`eager` \| `lazy`, preserved across updates)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --tool-loading lazy` |
 | **Direct CLI mode** *(for Swarm workers & non-MCP scripts)* | `node ~/.gemini/config/plugins/agy-fast/dist/mcp-server.mjs --cli <search\|outline\|slice\|edit\|check>` |
+| **Standalone MCP stdio server** *(standard MCP hosts; forwards flags like `--schema-compat=minimal`)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs mcp` *(or `agy-fast-mcp`)* |
 | **Uninstall cleanly** | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs uninstall` |
 
 > From a local repository clone, `./install.sh <command>` (macOS/Linux) and `.\install.ps1 <command>` (Windows) accept the same subcommands (`doctor`, `update`, `config`, `uninstall`).
@@ -279,6 +280,7 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 | `AGY_FAST_REPO` | Git URL | Use a custom mirror or fork |
 | `AGY_FAST_EDITS_FORMAT` | `auto` *(default)* \| `array` \| `string` | Controls `apply_edits.edits` schema (`auto` uses token-saving native arrays on eager-capable CLI ≥1.5.8, Desktop 2.0, IDE, and third-party hosts, and switches to JSON array strings on pre-eager CLI 1.5.0–1.5.7; server always accepts both) |
 | `AGY_FAST_HOST` | e.g. `cli@1.5.14`, `ide@2.7.0`, `desktop@2.34.0` | Overrides auto-detected Antigravity host surface & version |
+| `AGY_FAST_SCHEMA_COMPAT` | `standard` *(default)* \| `minimal` | Strips numeric/array range keywords (`minimum`/`maximum`/`minItems`/`maxItems`) from `tools/list` for strict JSON Schema subset hosts (also `--schema-compat=minimal`; runtime validation stays unchanged) |
 
 **Applying updates:** Updated `rules/AGENTS.md` and `dist/session-start.mjs` take effect automatically on the next new session. In Antigravity Desktop 2.0 / IDE, reload or restart the window once to refresh the resident MCP server process.
 

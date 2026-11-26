@@ -14,7 +14,8 @@
     "node": ">=20.0.0"
   },
   "bin": {
-    "agy-fast": "./scripts/install.mjs"
+    "agy-fast": "./scripts/install.mjs",
+    "agy-fast-mcp": "./dist/mcp-server.mjs"
   },
   "files": [
     "plugin.json",

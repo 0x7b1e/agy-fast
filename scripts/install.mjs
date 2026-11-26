@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -275,6 +275,7 @@ Commands:
   uninstall    Remove installed agy-fast plugin
   status       Check installation and run live health checks
   doctor       Alias for status
+  mcp          Start standalone MCP stdio server (forwards extra args)
 
 Options:
   --project [dir]               Install/update <dir>/.agents/plugins/agy-fast
@@ -1817,6 +1818,18 @@ async function runUninstall(opts) {
 }
 
 async function main() {
+  if (process.argv[2] === "mcp") {
+    const mcpServerPath = path.join(REPO_ROOT, "dist", "mcp-server.mjs");
+    if (!(await pathExists(mcpServerPath))) {
+      throw new Error(
+        `Built MCP server not found at ${mcpServerPath}. Run 'npm run build' first.`,
+      );
+    }
+    process.argv = [process.argv[0], mcpServerPath, ...process.argv.slice(3)];
+    await import(pathToFileURL(mcpServerPath).href);
+    return;
+  }
+
   const opts = parseArgs(process.argv);
   if (opts.showHelp) {
     printHelp();

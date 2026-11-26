@@ -18,6 +18,7 @@ function buildCleanServerEnv(
   delete env.ANTIGRAVITY_APP_DATA_DIR;
   delete env.AGY_FAST_HOST;
   delete env.AGY_FAST_EDITS_FORMAT;
+  delete env.AGY_FAST_SCHEMA_COMPAT;
   delete env.AGY_FAST_CACHE_DIR;
   delete env.PLUGIN_ROOT;
   delete env.AGY_PLUGIN_ROOT;
@@ -32,9 +33,10 @@ function buildCleanServerEnv(
 function sendMessagesToServer(
   rawChunks: Array<string | Buffer>,
   extraEnv: Record<string, string | undefined> = {},
+  extraArgs: string[] = [],
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [MCP_SERVER_SCRIPT], {
+    const child = spawn(process.execPath, [MCP_SERVER_SCRIPT, ...extraArgs], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
       env: buildCleanServerEnv(extraEnv),
@@ -1266,6 +1268,190 @@ describe("MCP Stdio Server end-to-end", () => {
     assert.deepEqual(
       crlfSplitRes.map((r) => r.id),
       [4, 7],
+    );
+  });
+
+  it("supports --schema-compat=minimal and AGY_FAST_SCHEMA_COMPAT=minimal while preserving property names and runtime validation", async () => {
+    const ALLOWED_MINIMAL_KEYWORDS = new Set([
+      "type",
+      "properties",
+      "required",
+      "additionalProperties",
+      "items",
+      "enum",
+      "const",
+      "description",
+      "title",
+      "default",
+      "examples",
+    ]);
+
+    const assertStrictMinimalSubset = (node: unknown, pointer = "$"): void => {
+      assert.ok(node && typeof node === "object" && !Array.isArray(node), `${pointer} must be an object`);
+      for (const [key, val] of Object.entries(node as Record<string, unknown>)) {
+        assert.ok(
+          ALLOWED_MINIMAL_KEYWORDS.has(key),
+          `unexpected JSON Schema keyword '${key}' at ${pointer}`,
+        );
+        if (key === "properties") {
+          assert.ok(val && typeof val === "object" && !Array.isArray(val));
+          for (const [propName, propSchema] of Object.entries(val as Record<string, unknown>)) {
+            assertStrictMinimalSubset(propSchema, `${pointer}.properties.${propName}`);
+          }
+        } else if (key === "items") {
+          assertStrictMinimalSubset(val, `${pointer}.items`);
+        }
+      }
+    };
+
+    const listTools = async (
+      extraEnv: Record<string, string | undefined> = {},
+      extraArgs: string[] = [],
+    ) => {
+      const res = await sendMessagesToServer(
+        [
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {
+              protocolVersion: "2025-03-26",
+              capabilities: {},
+              clientInfo: { name: "strict-subset-client", version: "1.0.0" },
+            },
+          }) + "\n",
+          JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) + "\n",
+        ],
+        extraEnv,
+        extraArgs,
+      );
+      assert.equal(res.code, 0, res.stderr);
+      assert.equal(res.stderr, "");
+      const lines = res.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      return lines.find((l) => l.id === 2)?.result?.tools as Array<{
+        name: string;
+        description: string;
+        inputSchema: Record<string, unknown>;
+      }>;
+    };
+
+    const standardTools = await listTools();
+    const minimalCliTools = await listTools({}, ["--schema-compat=minimal"]);
+    const minimalEnvTools = await listTools({ AGY_FAST_SCHEMA_COMPAT: "minimal" });
+    // CLI flag overrides env var in both directions
+    const cliOverrideStandard = await listTools(
+      { AGY_FAST_SCHEMA_COMPAT: "minimal" },
+      ["--schema-compat", "standard"],
+    );
+    // Unrecognized env var falls back safely to standard
+    const invalidEnvFallback = await listTools({ AGY_FAST_SCHEMA_COMPAT: "bogus" });
+
+    assert.deepEqual(minimalCliTools, minimalEnvTools);
+    assert.deepEqual(cliOverrideStandard, standardTools);
+    assert.deepEqual(invalidEnvFallback, standardTools);
+
+    assert.equal(minimalCliTools.length, 5);
+    for (let i = 0; i < minimalCliTools.length; i++) {
+      const stdTool = standardTools[i]!;
+      const minTool = minimalCliTools[i]!;
+      assert.equal(minTool.name, stdTool.name);
+      assert.equal(hasDisallowedSchemaKeyword(minTool.inputSchema), false);
+      assertStrictMinimalSubset(minTool.inputSchema, minTool.name);
+      const stdBytes = Buffer.byteLength(JSON.stringify(stdTool), "utf8");
+      const minBytes = Buffer.byteLength(JSON.stringify(minTool), "utf8");
+      assert.ok(minBytes <= 1280, `${minTool.name} minimal schema exceeds 1280B (${minBytes}B)`);
+      assert.ok(
+        minBytes < stdBytes,
+        `${minTool.name} minimal schema (${minBytes}B) should be smaller than standard (${stdBytes}B)`,
+      );
+    }
+
+    // Crucial regression guard: stripping JSON Schema 'pattern' keyword must NEVER
+    // remove the tool property literally named 'pattern' in batch_search.queries.
+    const batchSearchMin = minimalCliTools.find((t) => t.name === "batch_search")!;
+    const queryItemProps = (
+      (
+        (batchSearchMin.inputSchema.properties as Record<string, unknown>)
+          .queries as Record<string, unknown>
+      ).items as Record<string, unknown>
+    ).properties as Record<string, unknown>;
+    assert.deepEqual(queryItemProps.pattern, { type: "string" });
+
+    // Runtime validation remains intact even when minItems/minimum are stripped from schema
+    const runtimeCheck = await sendMessagesToServer(
+      [
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-03-26", capabilities: {} },
+        }) + "\n",
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "batch_search",
+            arguments: { cwd: tmpDir, queries: [] },
+          },
+        }) + "\n",
+      ],
+      {},
+      ["--schema-compat=minimal"],
+    );
+    assert.equal(runtimeCheck.code, 0);
+    const callReply = runtimeCheck.stdout
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l))
+      .find((l) => l.id === 2);
+    assert.equal(callReply.result.isError, true);
+
+    // Invalid CLI flag values fail fast; --help prints usage and exits 0
+    const badVal = await sendMessagesToServer([], {}, ["--schema-compat=invalid"]);
+    assert.equal(badVal.code, 1);
+    assert.match(badVal.stderr, /Invalid --schema-compat/);
+
+    const missingVal = await sendMessagesToServer([], {}, ["--schema-compat"]);
+    assert.equal(missingVal.code, 1);
+    assert.match(missingVal.stderr, /Missing value for --schema-compat/);
+
+    const unknownFlag = await sendMessagesToServer([], {}, ["--does-not-exist"]);
+    assert.equal(unknownFlag.code, 1);
+    assert.match(unknownFlag.stderr, /Unknown argument/);
+
+    const helpRes = await sendMessagesToServer([], {}, ["--help"]);
+    assert.equal(helpRes.code, 0);
+    assert.match(helpRes.stdout, /--schema-compat/);
+  });
+
+  it("enforces zero runtime dependencies, bundle size budget, and portable bin packaging", async () => {
+    const pkgPath = path.resolve(process.cwd(), "package.json");
+    const pkg = JSON.parse(await fs.readFile(pkgPath, "utf8")) as {
+      dependencies?: Record<string, string>;
+      bin?: Record<string, string>;
+      files?: string[];
+    };
+
+    assert.equal(
+      Object.keys(pkg.dependencies ?? {}).length,
+      0,
+      "agy-fast must keep zero runtime dependencies",
+    );
+    assert.equal(pkg.bin?.["agy-fast"], "./scripts/install.mjs");
+    assert.equal(pkg.bin?.["agy-fast-mcp"], "./dist/mcp-server.mjs");
+    assert.ok(Array.isArray(pkg.files) && pkg.files.includes("dist/*.mjs"));
+    assert.ok(Array.isArray(pkg.files) && pkg.files.includes("scripts/install.mjs"));
+
+    const serverBuf = await fs.readFile(MCP_SERVER_SCRIPT);
+    assert.ok(
+      serverBuf.subarray(0, 32).toString("utf8").startsWith("#!/usr/bin/env node\n"),
+      "dist/mcp-server.mjs must start with a node shebang for portable npx/bin execution",
+    );
+    const MAX_MCP_BUNDLE_BYTES = 512 * 1024;
+    assert.ok(
+      serverBuf.byteLength <= MAX_MCP_BUNDLE_BYTES,
+      `dist/mcp-server.mjs is ${serverBuf.byteLength} bytes, exceeding ${MAX_MCP_BUNDLE_BYTES}-byte anti-bloat budget`,
     );
   });
 });
