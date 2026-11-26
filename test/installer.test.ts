@@ -867,4 +867,114 @@ describe("installer", () => {
       await fs.rm(ambientHome, { recursive: true, force: true });
     }
   });
+
+  it("generates standard MCP JSON config snippets, valid Antigravity mcp_config, and tailored generic rules", async () => {
+    const cfgHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-mcpcfg-"));
+    try {
+      const env = makeIsolatedEnv(cfgHome);
+      const customTarget = path.join(cfgHome, 'custom "$plugin"');
+      const expectedPosix = path.join(customTarget, "dist", "mcp-server.mjs").split(path.sep).join("/");
+
+      // 1. Default mcp-only JSON output + --schema-compat=minimal support
+      const jsonOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "mcp-config", "--quiet", "--target", customTarget],
+        { env, encoding: "utf8" },
+      );
+      assert.deepEqual(JSON.parse(jsonOut).mcpServers["agy-fast"], {
+        command: "node",
+        args: [expectedPosix],
+      });
+
+      const minOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "mcp-config", "--quiet", "--host=generic", "--schema-compat=minimal", "--target", customTarget],
+        { env, encoding: "utf8" },
+      );
+      assert.deepEqual(JSON.parse(minOut).mcpServers["agy-fast"], {
+        command: "node",
+        args: [expectedPosix, "--schema-compat=minimal"],
+      });
+
+      // 2. Antigravity mcp_config.json uses tools.<name>.eager (no invalid toolLoading key) and respects --tool-loading lazy
+      const agyOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "mcp-config", "--quiet", "--host", "antigravity", "--target", customTarget],
+        { env, encoding: "utf8" },
+      );
+      const agyCfg = JSON.parse(agyOut);
+      assert.equal(agyCfg.mcpServers.fast.toolLoading, undefined);
+      assert.equal(agyCfg.mcpServers.fast.tools.batch_search.eager, true);
+      assert.equal(agyCfg.mcpServers.fast.tools.run_checks.eager, true);
+
+      const agyLazyOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "mcp-config", "--quiet", "--host", "antigravity", "--tool-loading", "lazy", "--target", customTarget],
+        { env, encoding: "utf8" },
+      );
+      assert.equal(JSON.parse(agyLazyOut).mcpServers.fast.tools, undefined);
+
+      // 3. Host-agnostic rules template handles read_slices, shared cwd, dev schema bounds, filtered CLI subcommands, and shell quoting
+      const sliceRulesOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "mcp-config", "--rules", "--tools", "read_slices", "--target", customTarget],
+        { env, encoding: "utf8" },
+      );
+      assert.match(sliceRulesOut, /`read_slices`/);
+      assert.match(sliceRulesOut, /Pass explicit `cwd`/);
+      assert.match(sliceRulesOut, /lineRanges/);
+      assert.match(sliceRulesOut, /<=150/);
+      assert.match(sliceRulesOut, /--cli <slice>/);
+      assert.ok(sliceRulesOut.includes('\\"\\$plugin\\"'));
+
+      const subsetRulesOut = execFileSync(
+        process.execPath,
+        [
+          INSTALL_SCRIPT,
+          "mcp-config",
+          "--rules",
+          "--tools",
+          "batch_search,quick_outline,run_checks",
+          "--target",
+          customTarget,
+        ],
+        { env, encoding: "utf8" },
+      );
+      assert.match(subsetRulesOut, /`batch_search`/);
+      assert.match(subsetRulesOut, /contextLines.*0\.\.10/);
+      assert.match(subsetRulesOut, /150/);
+      assert.match(subsetRulesOut, /--cli <search\|outline\|check>/);
+      assert.doesNotMatch(subsetRulesOut, /`apply_edits`/);
+      assert.doesNotMatch(subsetRulesOut, /`read_slices`/);
+      assert.doesNotMatch(subsetRulesOut, /mcp_agy-fast_fast_|call_mcp_tool|toolSummary|SessionStart/);
+
+      // 4. Invalid --host, --tools without --rules, or cross-command flags fail fast
+      assert.throws(
+        () =>
+          execFileSync(process.execPath, [INSTALL_SCRIPT, "mcp-config", "--host", "codex"], {
+            env,
+            encoding: "utf8",
+          }),
+        /Invalid value after --host/,
+      );
+      assert.throws(
+        () =>
+          execFileSync(process.execPath, [INSTALL_SCRIPT, "mcp-config", "--tools", "batch_search"], {
+            env,
+            encoding: "utf8",
+          }),
+        /only supported with --rules/,
+      );
+      assert.throws(
+        () =>
+          execFileSync(process.execPath, [INSTALL_SCRIPT, "install", "--tools", "batch_search"], {
+            env,
+            encoding: "utf8",
+          }),
+        /only supported with the 'mcp-config' command/,
+      );
+    } finally {
+      await fs.rm(cfgHome, { recursive: true, force: true });
+    }
+  });
 });
