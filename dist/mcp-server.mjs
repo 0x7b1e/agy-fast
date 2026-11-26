@@ -64,6 +64,38 @@ function parseMaybeJsonArray(value) {
     detail: describeValueType(value)
   };
 }
+function parseMaybeStringOrJsonArray(value) {
+  const parsed = parseMaybeJsonArray(value);
+  if (parsed.ok || parsed.kind === "corrupted_literal" || parsed.kind === "missing") {
+    return parsed;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return parsed;
+    }
+    if (trimmed.startsWith("[") || trimmed.startsWith("{") || trimmed.startsWith("```") || /[\r\n]/.test(trimmed)) {
+      return parsed;
+    }
+    if (parsed.kind === "invalid_json" && parsed.detail.startsWith("decoded to ")) {
+      return parsed;
+    }
+    return { ok: true, value: [trimmed] };
+  }
+  return parsed;
+}
+var TOOL_VALIDATION_EXAMPLES = {
+  batch_search: '{"queries":[{"type":"text","pattern":"foo","path":"src"}]}',
+  apply_edits: '{"edits":[{"path":"src/app.ts","hunks":[{"target":"old","replacement":"new"}]}]}',
+  read_slices: '{"outlines":["src/app.ts"],"lineRanges":["src/app.ts:1-60"]}',
+  read_slices_line_range: '{"lineRanges":["src/app.ts:1-60"]}',
+  quick_outline: '{"paths":["src/app.ts"]}',
+  run_checks: '{"commands":[{"name":"test","command":"npm test"}]}'
+};
+function withValidationExample(message, exampleJson) {
+  return `${message}
+Example: ${exampleJson}`;
+}
 function formatCorruptedArrayError(options) {
   const details = options.items.slice(0, 8).map(
     (item) => `- ${item.label}: received ${describeValueType(item.value)} instead of ${item.expected ?? "an object"}`
@@ -2704,6 +2736,61 @@ function corruptedEditsError(items) {
     isError: true
   };
 }
+function resolveHunkFieldWithAliases(rawHunk, canonicalKey, aliasKeys) {
+  const hasCanonical = rawHunk[canonicalKey] !== void 0;
+  const presentAliases = aliasKeys.filter((key) => rawHunk[key] !== void 0);
+  if (hasCanonical) {
+    const canonicalVal = rawHunk[canonicalKey];
+    for (const aliasKey of presentAliases) {
+      if (rawHunk[aliasKey] !== canonicalVal) {
+        return {
+          ok: false,
+          error: `conflicting '${canonicalKey}' and alias '${aliasKey}' (values differ; omit the alias or make them identical)`
+        };
+      }
+    }
+    return { ok: true, value: canonicalVal };
+  }
+  if (presentAliases.length === 0) {
+    return { ok: true, value: void 0 };
+  }
+  const firstKey = presentAliases[0];
+  const firstVal = rawHunk[firstKey];
+  for (let k = 1; k < presentAliases.length; k++) {
+    const otherKey = presentAliases[k];
+    if (rawHunk[otherKey] !== firstVal) {
+      return {
+        ok: false,
+        error: `conflicting aliases '${firstKey}' and '${otherKey}' (values differ; use '${canonicalKey}')`
+      };
+    }
+  }
+  return { ok: true, value: firstVal };
+}
+function normalizeEditHunk(rawHunk) {
+  const targetRes = resolveHunkFieldWithAliases(rawHunk, "target", [
+    "oldText",
+    "old_string"
+  ]);
+  const replacementRes = resolveHunkFieldWithAliases(rawHunk, "replacement", [
+    "newText",
+    "new_string"
+  ]);
+  const errors = [];
+  if (!targetRes.ok) errors.push(targetRes.error);
+  if (!replacementRes.ok) errors.push(replacementRes.error);
+  if (errors.length > 0) {
+    return { ok: false, errors };
+  }
+  return {
+    ok: true,
+    hunk: {
+      ...rawHunk,
+      target: targetRes.value,
+      replacement: replacementRes.value
+    }
+  };
+}
 function formatErrorBulletsWithinBytes(heading, errors, maxBytes) {
   const full = `${heading}
 - ${errors.join("\n- ")}`;
@@ -2846,12 +2933,18 @@ async function runApplyEdits(input) {
     }
     if (parsedEdits.kind === "invalid_json") {
       return {
-        text: `Error: 'edits' is not a valid JSON array (0 files modified): ${parsedEdits.detail}`,
+        text: withValidationExample(
+          `Error: 'edits' is not a valid JSON array (0 files modified): ${parsedEdits.detail}`,
+          TOOL_VALIDATION_EXAMPLES.apply_edits
+        ),
         isError: true
       };
     }
     return {
-      text: "Error: 'edits' must be a non-empty JSON array string (or array) of file edit objects.",
+      text: withValidationExample(
+        "Error: 'edits' must be a non-empty JSON array string (or array) of file edit objects.",
+        TOOL_VALIDATION_EXAMPLES.apply_edits
+      ),
       isError: true
     };
   }
@@ -2876,6 +2969,7 @@ async function runApplyEdits(input) {
       continue;
     }
     let normalizedHunks;
+    const hunkAliasErrors = [];
     if (rawEntry.hunks !== void 0) {
       const parsedHunks = parseMaybeJsonArray(rawEntry.hunks);
       if (!parsedHunks.ok) {
@@ -2887,24 +2981,36 @@ async function runApplyEdits(input) {
         continue;
       }
       let hunkCorrupted = false;
+      const resolvedHunks = [];
       for (let j = 0; j < parsedHunks.value.length; j++) {
-        if (!isPlainObject(parsedHunks.value[j])) {
+        const rawHunk = parsedHunks.value[j];
+        if (!isPlainObject(rawHunk)) {
           corruptedItems.push({
             label: `edits[${i}].hunks[${j}]`,
-            value: parsedHunks.value[j],
+            value: rawHunk,
             expected: "a hunk object"
           });
           hunkCorrupted = true;
+          continue;
+        }
+        const normRes = normalizeEditHunk(rawHunk);
+        if (!normRes.ok) {
+          for (const message of normRes.errors) {
+            hunkAliasErrors.push({ hunkIndex: j, message });
+          }
+        } else {
+          resolvedHunks.push(normRes.hunk);
         }
       }
       if (hunkCorrupted) continue;
-      normalizedHunks = parsedHunks.value;
+      normalizedHunks = resolvedHunks;
     }
     normalizedEdits.push({
       path: rawEntry.path,
       hunks: normalizedHunks,
       create: rawEntry.create,
-      overwrite: rawEntry.overwrite
+      overwrite: rawEntry.overwrite,
+      ...hunkAliasErrors.length > 0 ? { hunkAliasErrors } : {}
     });
   }
   if (corruptedItems.length > 0) {
@@ -2920,13 +3026,19 @@ async function runApplyEdits(input) {
       const cmd = input.verify.command;
       if (typeof cmd !== "string" || !cmd.trim()) {
         return {
-          text: "Validation failed (0 files modified):\n- 'verify.command' must be a non-empty string.",
+          text: withValidationExample(
+            "Validation failed (0 files modified):\n- 'verify.command' must be a non-empty string.",
+            TOOL_VALIDATION_EXAMPLES.apply_edits
+          ),
           isError: true
         };
       }
       if (input.verify.cwd !== void 0 && typeof input.verify.cwd !== "string") {
         return {
-          text: "Validation failed (0 files modified):\n- 'verify.cwd' must be a string.",
+          text: withValidationExample(
+            "Validation failed (0 files modified):\n- 'verify.cwd' must be a string.",
+            TOOL_VALIDATION_EXAMPLES.apply_edits
+          ),
           isError: true
         };
       }
@@ -2939,7 +3051,10 @@ async function runApplyEdits(input) {
       };
     } else {
       return {
-        text: "Validation failed (0 files modified):\n- 'verify' must be a command string or { command, cwd?, timeoutSec? } object.",
+        text: withValidationExample(
+          "Validation failed (0 files modified):\n- 'verify' must be a command string or { command, cwd?, timeoutSec? } object.",
+          TOOL_VALIDATION_EXAMPLES.apply_edits
+        ),
         isError: true
       };
     }
@@ -2970,11 +3085,22 @@ async function runApplyEdits(input) {
     const entry = normalizedEdits[i];
     if (typeof entry.path !== "string" || !entry.path.trim()) {
       errors.push(`edits[${i}]: 'path' must be a non-empty string`);
+      if (entry.hunkAliasErrors) {
+        for (const err of entry.hunkAliasErrors) {
+          errors.push(`edits[${i}] hunk #${err.hunkIndex + 1}: ${err.message}`);
+        }
+      }
       continue;
     }
     const absPath = resolvePath(entry.path, baseCwd);
     const writeTargetPath = await canonicalizeTargetPath(absPath);
     const relPath = toPosixPath(path3.relative(baseCwd, absPath)) || path3.basename(absPath);
+    if (entry.hunkAliasErrors && entry.hunkAliasErrors.length > 0) {
+      for (const err of entry.hunkAliasErrors) {
+        errors.push(`${relPath} hunk #${err.hunkIndex + 1}: ${err.message}`);
+      }
+      continue;
+    }
     if (isGitInternalPath(absPath) || isGitInternalPath(writeTargetPath)) {
       errors.push(`${relPath}: refusing to modify Git internal metadata path (.git)`);
       continue;
@@ -3008,9 +3134,16 @@ async function runApplyEdits(input) {
     }
   }
   if (errors.length > 0) {
+    const exampleSuffix = `
+Example: ${TOOL_VALIDATION_EXAMPLES.apply_edits}`;
+    const exampleSuffixBytes = Buffer.byteLength(exampleSuffix, "utf8");
+    const formatted = formatErrorBulletsWithinBytes(
+      "Validation failed (0 files modified):",
+      errors,
+      DEFAULT_INLINE_MAX_BYTES - exampleSuffixBytes
+    );
     return {
-      text: `Validation failed (0 files modified):
-- ${errors.join("\n- ")}`,
+      text: withValidationExample(formatted, TOOL_VALIDATION_EXAMPLES.apply_edits),
       isError: true
     };
   }
@@ -3175,6 +3308,23 @@ async function runApplyEdits(input) {
   const bestEffort = Boolean(input.bestEffort);
   if (errors.length > 0 && (!bestEffort || plans.length === 0)) {
     const prefix = bestEffort ? "Edit aborted (0 files modified):" : "Atomic edit aborted (0 files modified):";
+    const hasSchemaTypeError = errors.some(
+      (e) => e.includes("'target' must be") || e.includes("'replacement' must be") || e.includes("must be an object with 'target' and 'replacement'")
+    );
+    if (hasSchemaTypeError) {
+      const exampleSuffix = `
+Example: ${TOOL_VALIDATION_EXAMPLES.apply_edits}`;
+      const exampleSuffixBytes = Buffer.byteLength(exampleSuffix, "utf8");
+      const formatted = formatErrorBulletsWithinBytes(
+        prefix,
+        errors,
+        DEFAULT_INLINE_MAX_BYTES - exampleSuffixBytes
+      );
+      return {
+        text: withValidationExample(formatted, TOOL_VALIDATION_EXAMPLES.apply_edits),
+        isError: true
+      };
+    }
     return {
       text: formatErrorBulletsWithinBytes(prefix, errors, DEFAULT_INLINE_MAX_BYTES),
       isError: true
@@ -5193,16 +5343,36 @@ async function executeSingleQuery(query, index, baseCwd, useRg, budget) {
   const header = `## Query ${index + 1} [${query.type}] ${query.pattern}${query.path ? ` (in ${query.path})` : ""}`;
   try {
     if (!query.pattern || typeof query.pattern !== "string") {
-      throw new Error("Query 'pattern' must be a non-empty string");
+      throw new Error(
+        withValidationExample(
+          "Query 'pattern' must be a non-empty string",
+          TOOL_VALIDATION_EXAMPLES.batch_search
+        )
+      );
     }
     if (query.multiline !== void 0 && typeof query.multiline !== "boolean") {
-      throw new Error("multiline must be a boolean");
+      throw new Error(
+        withValidationExample(
+          "multiline must be a boolean",
+          TOOL_VALIDATION_EXAMPLES.batch_search
+        )
+      );
     }
     if (query.outputMode !== void 0 && !["content", "files_with_matches", "count"].includes(query.outputMode)) {
-      throw new Error("Invalid outputMode");
+      throw new Error(
+        withValidationExample(
+          "Invalid outputMode",
+          TOOL_VALIDATION_EXAMPLES.batch_search
+        )
+      );
     }
     if (query.sortBy !== void 0 && !["path", "mtime"].includes(query.sortBy)) {
-      throw new Error("Invalid sortBy");
+      throw new Error(
+        withValidationExample(
+          "Invalid sortBy",
+          TOOL_VALIDATION_EXAMPLES.batch_search
+        )
+      );
     }
     const searchRoot = query.path ? resolvePath(query.path, baseCwd) : baseCwd;
     let targetStat;
@@ -5264,7 +5434,12 @@ ${formattedBody}`;
         } : void 0
       };
     }
-    throw new Error(`Unsupported query type: ${String(query.type)}`);
+    throw new Error(
+      withValidationExample(
+        `Unsupported query type: ${String(query.type)}`,
+        TOOL_VALIDATION_EXAMPLES.batch_search
+      )
+    );
   } catch (err) {
     return { header, text: `${header}
 ERROR: ${err instanceof Error ? err.message : String(err)}` };
@@ -5291,14 +5466,20 @@ async function runBatchSearch(input, options = {}) {
       };
     }
     return {
-      text: "Error: 'queries' must be a non-empty array of search queries.",
+      text: withValidationExample(
+        "Error: 'queries' must be a non-empty array of search queries.",
+        TOOL_VALIDATION_EXAMPLES.batch_search
+      ),
       isError: true
     };
   }
   const rawQueries = parsedQueries.value;
   if (rawQueries.length === 0) {
     return {
-      text: "Error: 'queries' must be a non-empty array of search queries.",
+      text: withValidationExample(
+        "Error: 'queries' must be a non-empty array of search queries.",
+        TOOL_VALIDATION_EXAMPLES.batch_search
+      ),
       isError: true
     };
   }
@@ -7679,38 +7860,55 @@ ${pickedLines.join("\n")}${packed.footer}`;
 async function runReadSlices(input) {
   const corruptedItems = [];
   let outlines = [];
+  let sliceFormatError = null;
   if (input?.outlines !== void 0) {
-    const parsedOutlines = parseMaybeJsonArray(input.outlines);
+    const parsedOutlines = parseMaybeStringOrJsonArray(input.outlines);
     if (!parsedOutlines.ok) {
-      corruptedItems.push({
-        label: "outlines",
-        value: input.outlines,
-        expected: "an array of file path strings"
-      });
+      if (parsedOutlines.kind === "corrupted_literal" || input.outlines === null || typeof input.outlines === "boolean") {
+        corruptedItems.push({
+          label: "outlines",
+          value: parsedOutlines.kind === "corrupted_literal" ? parsedOutlines.value : input.outlines,
+          expected: "an array of file path strings"
+        });
+      } else {
+        sliceFormatError = withValidationExample(
+          `Error: 'outlines' must be an array of non-empty file path strings (${parsedOutlines.detail}).`,
+          TOOL_VALIDATION_EXAMPLES.read_slices
+        );
+      }
     } else {
       for (let i = 0; i < parsedOutlines.value.length; i++) {
         const item = parsedOutlines.value[i];
-        if (typeof item !== "string" || !item.trim()) {
+        if (item === null || typeof item === "boolean") {
           corruptedItems.push({
             label: `outlines[${i}]`,
             value: item,
             expected: "a non-empty file path string"
           });
+        } else if (typeof item !== "string" || !item.trim()) {
+          if (sliceFormatError === null) {
+            sliceFormatError = withValidationExample(
+              `Error: outlines[${i}] must be a non-empty file path string.`,
+              TOOL_VALIDATION_EXAMPLES.read_slices
+            );
+          }
         }
       }
-      if (corruptedItems.length === 0) {
+      if (corruptedItems.length === 0 && sliceFormatError === null) {
         outlines = parsedOutlines.value;
       }
     }
   }
   let slices = [];
-  let sliceFormatError = null;
   const parseSliceShorthand = (raw, label) => {
     const trimmed = raw.trim();
     const match = /^(.+):(\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*)$/.exec(trimmed);
     if (!match || !match[1].trim()) {
       if (sliceFormatError === null) {
-        sliceFormatError = `Error: ${label} must use 'path:start-end' or 'path:start1-end1,start2-end2' format (got ${JSON.stringify(raw)}).`;
+        sliceFormatError = withValidationExample(
+          `Error: ${label} must use 'path:start-end' or 'path:start1-end1,start2-end2' format (got ${JSON.stringify(raw)}).`,
+          TOOL_VALIDATION_EXAMPLES.read_slices_line_range
+        );
       }
       return null;
     }
@@ -7729,11 +7927,18 @@ async function runReadSlices(input) {
   if (input?.slices !== void 0) {
     const parsedSlices = parseMaybeJsonArray(input.slices);
     if (!parsedSlices.ok) {
-      corruptedItems.push({
-        label: "slices",
-        value: input.slices,
-        expected: "an array of slice objects ({ path, ranges }) or 'path:start-end' strings"
-      });
+      if (parsedSlices.kind === "corrupted_literal" || input.slices === null || typeof input.slices === "boolean") {
+        corruptedItems.push({
+          label: "slices",
+          value: parsedSlices.kind === "corrupted_literal" ? parsedSlices.value : input.slices,
+          expected: "an array of slice objects ({ path, ranges }) or 'path:start-end' strings"
+        });
+      } else if (sliceFormatError === null) {
+        sliceFormatError = withValidationExample(
+          `Error: 'slices' must be an array of slice objects ({ path, ranges }) or 'path:start-end' strings (${parsedSlices.detail}).`,
+          TOOL_VALIDATION_EXAMPLES.read_slices
+        );
+      }
     } else {
       const normalizedSlices = [];
       for (let i = 0; i < parsedSlices.value.length; i++) {
@@ -7743,7 +7948,7 @@ async function runReadSlices(input) {
           if (parsed) normalizedSlices.push(parsed);
           continue;
         }
-        if (!isPlainObject(item)) {
+        if (item === null || typeof item === "boolean") {
           corruptedItems.push({
             label: `slices[${i}]`,
             value: item,
@@ -7751,12 +7956,28 @@ async function runReadSlices(input) {
           });
           continue;
         }
-        if (item.ranges !== void 0 && !Array.isArray(item.ranges)) {
+        if (!isPlainObject(item)) {
+          if (sliceFormatError === null) {
+            sliceFormatError = withValidationExample(
+              `Error: slices[${i}] must be a slice object ({ path, ranges }) or 'path:start-end' string.`,
+              TOOL_VALIDATION_EXAMPLES.read_slices
+            );
+          }
+          continue;
+        }
+        if (item.ranges === null || typeof item.ranges === "boolean") {
           corruptedItems.push({
             label: `slices[${i}].ranges`,
             value: item.ranges,
             expected: "an array of [startLine, endLine] pairs"
           });
+        } else if (item.ranges !== void 0 && !Array.isArray(item.ranges)) {
+          if (sliceFormatError === null) {
+            sliceFormatError = withValidationExample(
+              `Error: slices[${i}].ranges must be an array of [startLine, endLine] pairs.`,
+              TOOL_VALIDATION_EXAMPLES.read_slices
+            );
+          }
         } else if (Array.isArray(item.ranges)) {
           for (let j = 0; j < item.ranges.length; j++) {
             const r = item.ranges[j];
@@ -7777,13 +7998,20 @@ async function runReadSlices(input) {
     }
   }
   if (input?.lineRanges !== void 0) {
-    const parsedSpecs = parseMaybeJsonArray(input.lineRanges);
+    const parsedSpecs = parseMaybeStringOrJsonArray(input.lineRanges);
     if (!parsedSpecs.ok) {
-      corruptedItems.push({
-        label: "lineRanges",
-        value: input.lineRanges,
-        expected: "an array of 'path:start-end' strings"
-      });
+      if (parsedSpecs.kind === "corrupted_literal" || input.lineRanges === null || typeof input.lineRanges === "boolean") {
+        corruptedItems.push({
+          label: "lineRanges",
+          value: parsedSpecs.kind === "corrupted_literal" ? parsedSpecs.value : input.lineRanges,
+          expected: "an array of 'path:start-end' strings"
+        });
+      } else if (sliceFormatError === null) {
+        sliceFormatError = withValidationExample(
+          `Error: 'lineRanges' must be an array of 'path:start-end' strings (${parsedSpecs.detail}).`,
+          TOOL_VALIDATION_EXAMPLES.read_slices_line_range
+        );
+      }
     } else {
       const normalizedSpecs = [];
       for (let i = 0; i < parsedSpecs.value.length; i++) {
@@ -7796,7 +8024,10 @@ async function runReadSlices(input) {
           });
         } else if (typeof item !== "string" || !item.trim()) {
           if (sliceFormatError === null) {
-            sliceFormatError = `Error: lineRanges[${i}] must be a non-empty 'path:start-end' string.`;
+            sliceFormatError = withValidationExample(
+              `Error: lineRanges[${i}] must be a non-empty 'path:start-end' string.`,
+              TOOL_VALIDATION_EXAMPLES.read_slices_line_range
+            );
           }
         } else {
           const parsed = parseSliceShorthand(item, `lineRanges[${i}]`);
@@ -7824,7 +8055,10 @@ async function runReadSlices(input) {
   }
   if (outlines.length === 0 && slices.length === 0) {
     return {
-      text: "Error: provide at least one entry in 'outlines', 'slices', or 'lineRanges'.",
+      text: withValidationExample(
+        "Error: provide at least one entry in 'outlines', 'slices', or 'lineRanges'.",
+        TOOL_VALIDATION_EXAMPLES.read_slices
+      ),
       isError: true
     };
   }
@@ -8008,11 +8242,14 @@ async function runQuickOutline(input) {
   const rawPaths = rawInput?.paths !== void 0 ? rawInput.paths : rawInput?.outlines !== void 0 ? rawInput.outlines : rawInput?.files;
   if (rawPaths === void 0) {
     return {
-      text: "Error: provide at least one file path in 'paths'.",
+      text: withValidationExample(
+        "Error: provide at least one file path in 'paths'.",
+        TOOL_VALIDATION_EXAMPLES.quick_outline
+      ),
       isError: true
     };
   }
-  const parsedPaths = parseMaybeJsonArray(rawPaths);
+  const parsedPaths = parseMaybeStringOrJsonArray(rawPaths);
   const corruptedItems = [];
   let firstInvalidError = null;
   if (!parsedPaths.ok) {
@@ -8023,7 +8260,10 @@ async function runQuickOutline(input) {
         expected: "an array of file path strings"
       });
     } else {
-      firstInvalidError = `Error: 'paths' must be an array of non-empty file path strings (${parsedPaths.detail}).`;
+      firstInvalidError = withValidationExample(
+        `Error: 'paths' must be an array of non-empty file path strings (${parsedPaths.detail}).`,
+        TOOL_VALIDATION_EXAMPLES.quick_outline
+      );
     }
   } else {
     for (let i = 0; i < parsedPaths.value.length; i++) {
@@ -8036,7 +8276,10 @@ async function runQuickOutline(input) {
         });
       } else if (typeof item !== "string" || !item.trim()) {
         if (firstInvalidError === null) {
-          firstInvalidError = `Error: paths[${i}] must be a non-empty file path string.`;
+          firstInvalidError = withValidationExample(
+            `Error: paths[${i}] must be a non-empty file path string.`,
+            TOOL_VALIDATION_EXAMPLES.quick_outline
+          );
         }
       }
     }
@@ -8058,7 +8301,10 @@ async function runQuickOutline(input) {
   const paths = parsedPaths.value;
   if (paths.length === 0) {
     return {
-      text: "Error: provide at least one file path in 'paths'.",
+      text: withValidationExample(
+        "Error: provide at least one file path in 'paths'.",
+        TOOL_VALIDATION_EXAMPLES.quick_outline
+      ),
       isError: true
     };
   }
@@ -8113,14 +8359,20 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
       };
     }
     return {
-      text: "Error: 'commands' must be a non-empty array of check commands.",
+      text: withValidationExample(
+        "Error: 'commands' must be a non-empty array of check commands.",
+        TOOL_VALIDATION_EXAMPLES.run_checks
+      ),
       isError: true
     };
   }
   const rawCommands = parsedCommands.value;
   if (rawCommands.length === 0) {
     return {
-      text: "Error: 'commands' must be a non-empty array of check commands.",
+      text: withValidationExample(
+        "Error: 'commands' must be a non-empty array of check commands.",
+        TOOL_VALIDATION_EXAMPLES.run_checks
+      ),
       isError: true
     };
   }
@@ -8172,7 +8424,10 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
     const spec = typeof raw === "string" ? { command: raw } : raw;
     if (!spec || typeof spec.command !== "string" || !spec.command.trim()) {
       return {
-        text: `Error: commands[${i}] must contain a non-empty 'command' string.`,
+        text: withValidationExample(
+          `Error: commands[${i}] must contain a non-empty 'command' string.`,
+          TOOL_VALIDATION_EXAMPLES.run_checks
+        ),
         isError: true
       };
     }

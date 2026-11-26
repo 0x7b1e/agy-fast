@@ -970,4 +970,16 @@ describe("run_checks", () => {
       assert.match(sigRes.text, /Terminated by SIGKILL - possible OOM/);
     }
   });
+
+  it("appends a parseable 1-line Example JSON on validation errors", async () => {
+    const emptyRes = await runChecks({ commands: [] });
+    assert.equal(emptyRes.isError, true);
+    const match = emptyRes.text.match(/\nExample: (\{.*\})$/);
+    assert.ok(match, emptyRes.text);
+    assert.ok(Array.isArray(JSON.parse(match[1]!).commands));
+
+    const missingCmd = await runChecks({ commands: [{ command: "   " }] });
+    assert.equal(missingCmd.isError, true);
+    assert.match(missingCmd.text, /\nExample: \{"commands":/);
+  });
 });

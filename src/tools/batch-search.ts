@@ -4,6 +4,8 @@ import {
   formatCorruptedArrayError,
   isPlainObject,
   parseMaybeJsonArray,
+  TOOL_VALIDATION_EXAMPLES,
+  withValidationExample,
   type CorruptedItem,
 } from "../utils/arg-validation.js";
 import {
@@ -2344,16 +2346,36 @@ async function executeSingleQuery(
   const header = `## Query ${index + 1} [${query.type}] ${query.pattern}${query.path ? ` (in ${query.path})` : ""}`;
   try {
     if (!query.pattern || typeof query.pattern !== "string") {
-      throw new Error("Query 'pattern' must be a non-empty string");
+      throw new Error(
+        withValidationExample(
+          "Query 'pattern' must be a non-empty string",
+          TOOL_VALIDATION_EXAMPLES.batch_search,
+        ),
+      );
     }
     if (query.multiline !== undefined && typeof query.multiline !== "boolean") {
-      throw new Error("multiline must be a boolean");
+      throw new Error(
+        withValidationExample(
+          "multiline must be a boolean",
+          TOOL_VALIDATION_EXAMPLES.batch_search,
+        ),
+      );
     }
     if (query.outputMode !== undefined && !["content", "files_with_matches", "count"].includes(query.outputMode)) {
-      throw new Error("Invalid outputMode");
+      throw new Error(
+        withValidationExample(
+          "Invalid outputMode",
+          TOOL_VALIDATION_EXAMPLES.batch_search,
+        ),
+      );
     }
     if (query.sortBy !== undefined && !["path", "mtime"].includes(query.sortBy)) {
-      throw new Error("Invalid sortBy");
+      throw new Error(
+        withValidationExample(
+          "Invalid sortBy",
+          TOOL_VALIDATION_EXAMPLES.batch_search,
+        ),
+      );
     }
     const searchRoot = query.path ? resolvePath(query.path, baseCwd) : baseCwd;
     let targetStat;
@@ -2428,7 +2450,12 @@ async function executeSingleQuery(
       };
     }
 
-    throw new Error(`Unsupported query type: ${String(query.type)}`);
+    throw new Error(
+      withValidationExample(
+        `Unsupported query type: ${String(query.type)}`,
+        TOOL_VALIDATION_EXAMPLES.batch_search,
+      ),
+    );
   } catch (err) {
     return { header, text: `${header}\nERROR: ${err instanceof Error ? err.message : String(err)}` };
   }
@@ -2464,14 +2491,20 @@ export async function runBatchSearch(
       };
     }
     return {
-      text: "Error: 'queries' must be a non-empty array of search queries.",
+      text: withValidationExample(
+        "Error: 'queries' must be a non-empty array of search queries.",
+        TOOL_VALIDATION_EXAMPLES.batch_search,
+      ),
       isError: true,
     };
   }
   const rawQueries = parsedQueries.value;
   if (rawQueries.length === 0) {
     return {
-      text: "Error: 'queries' must be a non-empty array of search queries.",
+      text: withValidationExample(
+        "Error: 'queries' must be a non-empty array of search queries.",
+        TOOL_VALIDATION_EXAMPLES.batch_search,
+      ),
       isError: true,
     };
   }

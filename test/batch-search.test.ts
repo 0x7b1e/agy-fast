@@ -1543,7 +1543,6 @@ describe("batch_search", () => {
       await fs.rm(cjkDir, { recursive: true, force: true });
     }
   });
-
   it("enforces walkFiles maxDirs/timeoutMs budgets and supports contextLines up to 10", async () => {
     const budgetDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-walk-budget-"));
     try {
@@ -1623,5 +1622,19 @@ describe("batch_search", () => {
     } finally {
       await fs.rm(budgetDir, { recursive: true, force: true });
     }
+  });
+
+  it("appends a parseable 1-line Example JSON on validation errors", async () => {
+    const emptyRes = await runBatchSearch({ queries: [] });
+    assert.equal(emptyRes.isError, true);
+    const match = emptyRes.text.match(/\nExample: (\{.*\})$/);
+    assert.ok(match, emptyRes.text);
+    assert.ok(Array.isArray(JSON.parse(match[1]!).queries));
+
+    const badQueryRes = await runBatchSearch({
+      queries: [{ type: "unknown" as never, pattern: "foo" }],
+    });
+    assert.equal(badQueryRes.isError, false);
+    assert.match(badQueryRes.text, /Example: \{"queries":/);
   });
 });

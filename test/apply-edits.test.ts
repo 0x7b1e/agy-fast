@@ -1936,7 +1936,6 @@ describe("apply_edits", () => {
     assert.match(bulkRes.text, /Partial edit applied \(0\/49 file\(s\) written, 48 unchanged; 1 file\(s\) failed/);
     assert.match(bulkRes.text, /total 0 written, 48 unchanged\)/);
   });
-
   it("rejects hunk edits on non-UTF-8 files without corrupting bytes while allowing explicit create+overwrite", async () => {
     // CP1252 (0xe9 = 'é') + GBK (0xd6 0xd0 0xce 0xc4 = '中文') without NUL or UTF-16 BOM
     const legacyBytes = Buffer.from([
@@ -2001,5 +2000,114 @@ describe("apply_edits", () => {
     });
     assert.equal(overwriteRes.isError, false, overwriteRes.text);
     assert.equal(await fs.readFile(legacyPath, "utf8"), "// café\n// 中文\nconst x = 2;\n");
+  });
+
+  it("supports hunk aliases (oldText/old_string/newText/new_string), rejects conflicting aliases, and appends 1-line examples on validation errors", async () => {
+    const aliasFile = path.join(tmpDir, "alias-edits.ts");
+    await fs.writeFile(aliasFile, "const a = 1;\nconst b = 2;\nconst c = 3;\n", "utf8");
+
+    // 1. oldText/newText and old_string/new_string work silently (including empty string deletion)
+    const okRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "alias-edits.ts",
+          hunks: [
+            { oldText: "const a = 1;", newText: "const a = 10;" } as unknown as never,
+            { old_string: "const b = 2;\n", new_string: "" } as unknown as never,
+            { target: "const c = 3;", oldText: "const c = 3;", replacement: "const c = 30;" } as unknown as never,
+          ],
+        },
+      ],
+    });
+    assert.equal(okRes.isError, false, okRes.text);
+    assert.equal(await fs.readFile(aliasFile, "utf8"), "const a = 10;\nconst c = 30;\n");
+
+    // 2. Conflicting canonical field + alias or conflicting aliases fail cleanly without touching disk
+    const conflictCanonical = await runApplyEdits({
+      cwd: tmpDir,
+      bestEffort: true,
+      edits: [
+        {
+          path: "alias-edits.ts",
+          hunks: [
+            { target: "const a = 10;", oldText: "const a = 99;", replacement: "const a = 0;" } as unknown as never,
+          ],
+        },
+      ],
+    });
+    assert.equal(conflictCanonical.isError, true);
+    assert.match(conflictCanonical.text, /Validation failed \(0 files modified\)/);
+    assert.match(conflictCanonical.text, /conflicting 'target' and alias 'oldText'/);
+    assert.match(conflictCanonical.text, /\nExample: \{"edits":/);
+
+    const conflictAliases = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "alias-edits.ts",
+          hunks: [
+            { oldText: "const a = 10;", replacement: "x", newText: "y", new_string: "z" } as unknown as never,
+          ],
+        },
+      ],
+    });
+    assert.equal(conflictAliases.isError, true);
+    assert.match(conflictAliases.text, /conflicting 'replacement' and alias 'newText'/);
+
+    const conflictPairAliases = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "alias-edits.ts",
+          hunks: [
+            { oldText: "a", old_string: "b", newText: "x" } as unknown as never,
+          ],
+        },
+      ],
+    });
+    assert.equal(conflictPairAliases.isError, true);
+    assert.match(conflictPairAliases.text, /conflicting aliases 'oldText' and 'old_string'/);
+    assert.equal(await fs.readFile(aliasFile, "utf8"), "const a = 10;\nconst c = 30;\n");
+
+    // 3. Invalid edits string includes parseable 1-line Example JSON
+    const badJson = await runApplyEdits({ cwd: tmpDir, edits: "{" });
+    assert.equal(badJson.isError, true);
+    const exMatch = badJson.text.match(/\nExample: (\{.*\})$/);
+    assert.ok(exMatch, badJson.text);
+    assert.ok(Array.isArray(JSON.parse(exMatch[1]!).edits));
+
+    // 4. Unbounded structural validation errors + Example remain strictly <= 8,800 B UTF-8
+    const manyAliasConflictEdits = Array.from({ length: 50 }, (_, idx) => ({
+      path: `many-${idx}.ts`,
+      hunks: [
+        { oldText: "a", old_string: "b", newText: "x", new_string: "y" } as unknown as never,
+        { oldText: "c", old_string: "d", newText: "p", new_string: "q" } as unknown as never,
+      ],
+    }));
+    const massiveValidation = await runApplyEdits({
+      cwd: tmpDir,
+      edits: manyAliasConflictEdits,
+    });
+    assert.equal(massiveValidation.isError, true);
+    assert.ok(
+      Buffer.byteLength(massiveValidation.text, "utf8") <= 8800,
+      `Expected <= 8800 B, got ${Buffer.byteLength(massiveValidation.text, "utf8")}`,
+    );
+    assert.match(massiveValidation.text, /\nExample: \{"edits":/);
+
+    // 5. Phase 1 hunk schema errors (e.g. { find, replace }) include 1-line Example
+    const wrongHunkKeys = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "alias-edits.ts",
+          hunks: [{ find: "const a = 10;", replace: "const a = 20;" } as unknown as never],
+        },
+      ],
+    });
+    assert.equal(wrongHunkKeys.isError, true);
+    assert.match(wrongHunkKeys.text, /'target' must be a non-empty string/);
+    assert.match(wrongHunkKeys.text, /\nExample: \{"edits":/);
   });
 });
