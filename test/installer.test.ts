@@ -30,6 +30,7 @@ describe("installer", () => {
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir, USERPROFILE: homeDir };
     delete env.GEMINI_HOME;
     delete env.ANTIGRAVITY_APP_DATA_DIR;
+    delete env.AGY_FAST_TOOLS;
     for (const [k, v] of Object.entries(extra)) {
       if (v === undefined) delete env[k];
       else env[k] = v;
@@ -843,5 +844,27 @@ describe("installer", () => {
       { env: makeIsolatedEnv(fakeHome), encoding: "utf8" },
     );
     assert.match(cliOut, /package\.json/);
+  });
+
+  it("installs and passes doctor even when ambient AGY_FAST_TOOLS is set", async () => {
+    const ambientHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-ambient-tools-"));
+    try {
+      const env = makeIsolatedEnv(ambientHome, {
+        AGY_FAST_TOOLS: "batch_search,quick_outline,run_checks",
+      });
+      execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "install", "--no-enable", "--no-acp"],
+        { env, encoding: "utf8" },
+      );
+      const doctorOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "doctor"],
+        { env, encoding: "utf8" },
+      );
+      assert.match(doctorOut, /MCP server\s+: OK \(5 tools:/);
+    } finally {
+      await fs.rm(ambientHome, { recursive: true, force: true });
+    }
   });
 });

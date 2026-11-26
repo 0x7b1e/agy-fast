@@ -828,10 +828,13 @@ async function verifyStagedPlugin(stagingDir) {
     return { ok: false, version: "0.0.0", reason: "Invalid staged plugin.json manifest" };
   }
   const mcpPath = path2.join(stagingDir, "dist", "mcp-server.mjs");
+  const cleanMcpEnv = { ...process.env };
+  delete cleanMcpEnv.AGY_FAST_TOOLS;
   const smokeOk = await new Promise((resolve) => {
     const child = spawn2(process.execPath, [mcpPath], {
       stdio: ["pipe", "pipe", "ignore"],
-      windowsHide: true
+      windowsHide: true,
+      env: cleanMcpEnv
     });
     let stdout = "";
     const timer = setTimeout(() => {

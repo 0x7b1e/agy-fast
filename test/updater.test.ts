@@ -614,6 +614,19 @@ rl.on("line", (line) => {
     );
     const loudCheck = await verifyStagedPlugin(loudStage);
     assert.equal(loudCheck.ok, true);
+
+    // 4. verifyStagedPlugin succeeds even when ambient AGY_FAST_TOOLS is set in parent env
+    const ambientStage = path.join(rootTmp, "ambient-tools-stage");
+    await copyRuntimeFixture(ambientStage, "0.9.2", "ambient");
+    const prevTools = process.env.AGY_FAST_TOOLS;
+    process.env.AGY_FAST_TOOLS = "batch_search,quick_outline,run_checks";
+    try {
+      const ambientCheck = await verifyStagedPlugin(ambientStage);
+      assert.equal(ambientCheck.ok, true, ambientCheck.reason);
+    } finally {
+      if (prevTools === undefined) delete process.env.AGY_FAST_TOOLS;
+      else process.env.AGY_FAST_TOOLS = prevTools;
+    }
   });
 
   it("hardens GitHub API fallbacks (no release->main downgrade on error, sanitized html_url, cross-platform home dir)", async () => {
