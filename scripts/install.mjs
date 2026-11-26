@@ -16,6 +16,12 @@ const EXPECTED_MCP_TOOLS = [
   "quick_outline",
   "run_checks",
 ];
+const SUPPORTED_MCP_CONFIG_HOSTS = [
+  "mcp-only",
+  "json",
+  "generic",
+  "antigravity",
+];
 const MAX_LOCAL_RULE_BYTES = 256 * 1024;
 
 const RUNTIME_FILES = [
@@ -133,6 +139,10 @@ function parseArgs(argv) {
   let repoUrl = "";
   let editsFormat = "";
   let toolLoading = "";
+  let mcpHost = "";
+  let mcpToolsRaw = null;
+  let schemaCompat = "";
+  let printRules = false;
 
   const positional = [];
   for (let i = 0; i < args.length; i++) {
@@ -203,6 +213,49 @@ function parseArgs(argv) {
         );
       }
       toolLoading = args[++i].toLowerCase();
+    } else if (a === "--host" || a.startsWith("--host=")) {
+      const next = a.startsWith("--host=") ? a.slice("--host=".length) : args[i + 1];
+      if (!next || (!a.startsWith("--host=") && next.startsWith("-"))) {
+        throw new Error(
+          `Missing value after --host (expected: ${SUPPORTED_MCP_CONFIG_HOSTS.join(" | ")})`,
+        );
+      }
+      if (!a.startsWith("--host=")) i++;
+      const normalizedHost = next.trim().toLowerCase();
+      if (!SUPPORTED_MCP_CONFIG_HOSTS.includes(normalizedHost)) {
+        throw new Error(
+          `Invalid value after --host '${next}' (expected: ${SUPPORTED_MCP_CONFIG_HOSTS.join(" | ")})`,
+        );
+      }
+      mcpHost = normalizedHost;
+    } else if (a === "--tools" || a.startsWith("--tools=")) {
+      const next = a.startsWith("--tools=") ? a.slice("--tools=".length) : args[i + 1];
+      if (next === undefined || (!a.startsWith("--tools=") && next.startsWith("-"))) {
+        throw new Error(
+          `Missing value after --tools (valid tools: ${EXPECTED_MCP_TOOLS.join(", ")})`,
+        );
+      }
+      if (!a.startsWith("--tools=")) i++;
+      mcpToolsRaw = next;
+    } else if (a === "--schema-compat" || a.startsWith("--schema-compat=")) {
+      const next = a.startsWith("--schema-compat=")
+        ? a.slice("--schema-compat=".length)
+        : args[i + 1];
+      if (!next || (!a.startsWith("--schema-compat=") && next.startsWith("-"))) {
+        throw new Error(
+          "Missing value after --schema-compat (expected: standard | minimal)",
+        );
+      }
+      if (!a.startsWith("--schema-compat=")) i++;
+      const normalizedCompat = next.trim().toLowerCase();
+      if (!["standard", "minimal"].includes(normalizedCompat)) {
+        throw new Error(
+          `Invalid value after --schema-compat '${next}' (expected: standard | minimal)`,
+        );
+      }
+      schemaCompat = normalizedCompat;
+    } else if (a === "--rules") {
+      printRules = true;
     } else if (a === "--target") {
       const next = args[i + 1];
       if (!next || next.startsWith("-")) {
@@ -259,6 +312,10 @@ function parseArgs(argv) {
     repoUrl,
     editsFormat,
     toolLoading,
+    mcpHost,
+    mcpToolsRaw,
+    schemaCompat,
+    printRules,
   };
 }
 
@@ -272,6 +329,7 @@ Commands:
   install      Install agy-fast plugin (default)
   update       Check for and apply plugin updates from GitHub releases
   config       View or persist auto-update preferences
+  mcp-config   Print standard MCP JSON config snippet (or generic rules via --rules)
   uninstall    Remove installed agy-fast plugin
   status       Check installation and run live health checks
   doctor       Alias for status
@@ -294,6 +352,11 @@ Options:
   --edits-format auto|array|string
                                 Configure apply_edits.edits schema preference (default auto)
   --tool-loading eager|lazy     Configure MCP tool loading mode in mcp_config.json (default eager)
+  --host <target>               (mcp-config) Target JSON format: mcp-only | json | generic | antigravity
+  --schema-compat standard|minimal
+                                (mcp-config) Include --schema-compat=minimal in emitted args
+  --tools <list>                (mcp-config --rules) Comma-separated tool subset for rules template
+  --rules                       (mcp-config) Print host-agnostic Markdown routing rules
   -h, --help                    Show this help
 `);
 }
@@ -1817,6 +1880,196 @@ async function runUninstall(opts) {
   }
 }
 
+function parseMcpConfigTools(rawTools) {
+  if (rawTools === null) return null;
+  const parts = rawTools
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parts.length === 0) {
+    throw new Error(
+      `Invalid --tools value "${rawTools}". Expected comma-separated tool names from: ${EXPECTED_MCP_TOOLS.join(", ")}.`,
+    );
+  }
+  const invalid = parts.filter((name) => !EXPECTED_MCP_TOOLS.includes(name));
+  if (invalid.length > 0) {
+    throw new Error(
+      `Unknown tool(s) in --tools: ${invalid.join(", ")}. Valid tools: ${EXPECTED_MCP_TOOLS.join(", ")}.`,
+    );
+  }
+  return [...new Set(parts)];
+}
+
+async function resolveMcpEntryPosix(opts) {
+  const targetMcp = path.join(path.resolve(opts.targetDir), "dist", "mcp-server.mjs");
+  const repoMcp = path.join(REPO_ROOT, "dist", "mcp-server.mjs");
+  let chosen = targetMcp;
+  if (!opts.isCustomTarget && !opts.isProject) {
+    if (!(await pathExists(targetMcp)) && (await pathExists(repoMcp))) {
+      chosen = repoMcp;
+    }
+  }
+  const exists = await pathExists(chosen);
+  return { posix: chosen.split(path.sep).join("/"), exists };
+}
+
+function renderMcpConfigSnippet(host, mcpEntryPosix, opts) {
+  const args =
+    opts.schemaCompat === "minimal"
+      ? [mcpEntryPosix, "--schema-compat=minimal"]
+      : [mcpEntryPosix];
+  if (host === "antigravity") {
+    const serverCfg = {
+      command: "node",
+      args,
+    };
+    if (opts.toolLoading !== "lazy") {
+      serverCfg.tools = Object.fromEntries(
+        EXPECTED_MCP_TOOLS.map((name) => [name, { eager: true }]),
+      );
+    }
+    return `${JSON.stringify(
+      {
+        mcpServers: {
+          fast: serverCfg,
+        },
+      },
+      null,
+      2,
+    )}\n`;
+  }
+  return `${JSON.stringify(
+    {
+      mcpServers: {
+        "agy-fast": {
+          command: "node",
+          args,
+        },
+      },
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+function escapePosixDoubleQuoted(str) {
+  return str.replace(/(["\\$`])/g, "\\$1");
+}
+
+function renderGenericRulesTemplate(selectedTools, mcpEntryPosix) {
+  const enabled = new Set(selectedTools || EXPECTED_MCP_TOOLS);
+  const rows = [];
+  if (enabled.has("quick_outline")) {
+    rows.push(
+      "| Map symbol/section line ranges in large/unknown files (>300 lines; 10-20 files/batch, max 40) | `quick_outline` | Avoids blind full-file reads |",
+    );
+  }
+  if (enabled.has("read_slices")) {
+    rows.push(
+      "| Read multiple <=120-line symbol ranges across files in one call | `read_slices` | Inline cap <=8.8 KB UTF-8 |",
+    );
+  }
+  if (enabled.has("batch_search")) {
+    rows.push(
+      "| Run >=2 text/regex/glob/fuzzy/read-only git queries (even across repos) | `batch_search` | `pattern` always required; `contextLines` 0..10 |",
+    );
+  }
+  if (enabled.has("apply_edits")) {
+    rows.push(
+      "| Apply >=2 non-contiguous hunks, multi-file edits, or edit + inline `verify` | `apply_edits` | `create` XOR `hunks`; atomic or `bestEffort: true` |",
+    );
+  }
+  if (enabled.has("run_checks")) {
+    rows.push(
+      "| Run >=2 independent non-interactive shell commands concurrently | `run_checks` | Default `compact`; shared 150s budget |",
+    );
+  }
+
+  const bullets = [
+    "- **Pass explicit `cwd` when `roots/list` is unavailable**: Provide an absolute workspace `cwd` on tool calls when running in hosts without MCP `roots/list`.",
+  ];
+  if (enabled.has("quick_outline")) {
+    bullets.push(
+      "- **Outline before reading**: For unknown files >300 lines, run `quick_outline` first to map exact line ranges, then fetch targeted ranges.",
+    );
+  }
+  if (enabled.has("read_slices")) {
+    bullets.push(
+      "- **Use `read_slices` for targeted small ranges**: Prefer `lineRanges: ['path:start-end,s2-e2']` for <=150 total lines; for larger reads, use native ranged file reads instead of bulk-slicing >150 lines (8.8 KB inline cap).",
+    );
+  }
+  if (enabled.has("batch_search")) {
+    bullets.push(
+      "- **Batch searches & respect schema bounds**: Pack multiple queries into one `batch_search` using per-query `path`; `pattern` is always required (e.g., `\"*\"` for `glob`), glob uses `*`/`{a,b}` (no `|`), `contextLines` is `0..10`, and for large `git diff`/`git show` run `--stat` or path-scoped diffs first.",
+    );
+  }
+  if (enabled.has("apply_edits")) {
+    bullets.push(
+      "- **Safe multi-file edits**: Use `create` XOR `hunks` per entry; pass `bestEffort: true` when touching >=3 files so one mismatch does not roll back valid edits, and keep inline `verify` commands fast (<45s; `verifyTimeoutSec` max `150`s).",
+    );
+  }
+  if (enabled.has("run_checks")) {
+    bullets.push(
+      "- **Use `run_checks` for >=2 commands**: Keep single lightweight commands in the native shell; default to `outputMode: \"compact\"` (use `\"full\"` only when passing stdout is needed) and stay within the shared `150`s MCP budget.",
+    );
+  }
+
+  const cliMap = [
+    ["batch_search", "search"],
+    ["quick_outline", "outline"],
+    ["read_slices", "slice"],
+    ["apply_edits", "edit"],
+    ["run_checks", "check"],
+  ];
+  const cliSubcmds = cliMap
+    .filter(([tool]) => enabled.has(tool))
+    .map(([, sub]) => sub);
+  if (cliSubcmds.length > 0) {
+    bullets.push(
+      `- **CLI fallback for subagents/scripts**: Invoke \`node "${escapePosixDoubleQuoted(mcpEntryPosix)}" --cli <${cliSubcmds.join("|")}> ...\` (put per-query modifiers before each query).`,
+    );
+  }
+
+  return [
+    "# agy-fast Tool Routing Rules",
+    "",
+    "Batch independent operations into one `agy-fast` MCP call whenever possible (output hard-capped at <=8.8 KB UTF-8):",
+    "",
+    "| Task | Preferred Tool | Notes |",
+    "| :--- | :--- | :--- |",
+    ...rows,
+    "",
+    "## Guidelines",
+    "",
+    ...bullets,
+    "",
+  ].join("\n");
+}
+
+async function runMcpConfig(opts) {
+  const host = opts.mcpHost || "mcp-only";
+  const tools = parseMcpConfigTools(opts.mcpToolsRaw);
+  if (!opts.printRules && tools !== null) {
+    throw new Error(
+      "--tools in 'mcp-config' is only supported with --rules until server-side --tools filtering lands.",
+    );
+  }
+  if (opts.printRules && opts.mcpHost) {
+    console.error(`Warning: --host '${opts.mcpHost}' is ignored when --rules is set.`);
+  }
+  const entry = await resolveMcpEntryPosix(opts);
+  if (!entry.exists && !opts.quiet) {
+    console.error(
+      `Warning: MCP server entrypoint not found at ${entry.posix} (run 'install' or 'npm run build' first).`,
+    );
+  }
+  if (opts.printRules) {
+    process.stdout.write(renderGenericRulesTemplate(tools, entry.posix));
+    return;
+  }
+  process.stdout.write(renderMcpConfigSnippet(host, entry.posix, opts));
+}
+
 async function main() {
   if (process.argv[2] === "mcp") {
     const mcpServerPath = path.join(REPO_ROOT, "dist", "mcp-server.mjs");
@@ -1836,6 +2089,15 @@ async function main() {
     return;
   }
 
+  if (
+    opts.command !== "mcp-config" &&
+    (opts.mcpHost || opts.mcpToolsRaw !== null || opts.schemaCompat || opts.printRules)
+  ) {
+    throw new Error(
+      "--host, --tools, --schema-compat, and --rules are only supported with the 'mcp-config' command.",
+    );
+  }
+
   switch (opts.command) {
     case "install":
       await runInstall(opts);
@@ -1845,6 +2107,9 @@ async function main() {
       break;
     case "config":
       await runConfig(opts);
+      break;
+    case "mcp-config":
+      await runMcpConfig(opts);
       break;
     case "uninstall":
       await runUninstall(opts);
