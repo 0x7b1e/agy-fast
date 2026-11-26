@@ -19,7 +19,7 @@
 [![Glama MCP Server](https://glama.ai/mcp/servers/INK-Q/agy-fast/badges/score.svg)](https://glama.ai/mcp/servers/INK-Q/agy-fast)
 [![HOL Guard Verified](https://img.shields.io/endpoint?url=https%3A%2F%2Fhol.org%2Fapi%2Fregistry%2Fbadges%2Fplugin%3Fslug%3Dink-q%252Fagy-fast%26metric%3Dscore&style=flat-square&labelColor=0F172A)](https://hol.org/registry/plugins/ink-q%2Fagy-fast?utm_source=hol_marketplace&utm_medium=plugins_badge&utm_campaign=plugins&utm_content=ink-q%2Fagy-fast&ref=plugin-author-5dc88d78)
 
-[English](README.md) · 简体中文 · [快速开始](#快速开始) · [实测数据](#实测数据) · [MCP 工具](#5-个核心-mcp-工具) · [性能分析报告](docs/ANALYSIS_REPORT.zh-CN.md) · [更新日志](CHANGELOG.md)
+[English](README.md) · 简体中文 · [繁體中文](README.zh-TW.md) · [快速开始](#快速开始) · [实测数据](#实测数据) · [MCP 工具](#5-个核心-mcp-工具) · [性能分析报告](docs/ANALYSIS_REPORT.zh-CN.md) · [更新日志](CHANGELOG.md)
 
 </div>
 
@@ -213,7 +213,7 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 - **大纲与小切片合一**：支持同等 15 种格式符号大纲（支持单文件广度优先水填充分配），并可在同一次请求中顺带读取少量小行段（总输出死守 `≤8.8 KB` UTF-8 上限）；大段正文读取自动引导至并行内置 `read_file`。
 
 ### 5. `run_checks` — 并发构建、规范检查、测试与诊断执行器
-- **单次最多 12 条命令**：在受控并发池（`concurrency: 1..8`）中并行执行独立非交互命令，支持单条超时强杀（`1..170 s`，单次调用共享 `170 s` 预算以适配 Antigravity `180 s` MCP 上限）、ANSI 转义符清理，并在 Windows 下自动透明解包针对白名单 CLI（`git`/`npm`/`node`/`rg`/`pytest`/`cargo` 等）的冗余 `powershell -Command "..."` 包装，免去 PowerShell 冷启动开销（PowerShell cmdlet、别名与管道完全原样保留）。
+- **单次最多 12 条命令**：在受控并发池（`concurrency: 1..8`）中并行执行独立非交互命令，支持单条超时强杀（`1..150 s`，单次调用共享 `150 s` 预算以适配 Antigravity `180 s` MCP 上限）、ANSI 转义符清理，并在 Windows 下自动透明解包针对白名单 CLI（`git`/`npm`/`node`/`rg`/`pytest`/`cargo` 等）的冗余 `powershell -Command "..."` 包装，免去 PowerShell 冷启动开销（PowerShell cmdlet、别名与管道完全原样保留）。
 - **头尾折叠（Head-Tail）双输出模式**：默认 `compact` 模式将通过项折叠为 1 行摘要、超长失败日志采用**头尾折叠**（同时保留首条根因报错与末尾测试汇总/堆栈尾部）；`full` 模式在 `≤8.8 KB` 预算内保留标准输出，超限时同样采用头尾折叠。
 
 <details>
