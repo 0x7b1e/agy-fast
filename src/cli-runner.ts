@@ -66,7 +66,7 @@ export function formatCliUsage(): string {
     "                          [--context <0..5>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
     "                          (modifiers before a query scope only to that query; trailing modifiers apply to all)",
     "  check   | run_checks    <cmd...> [--compact|--full] [--concurrency <N>] [--timeout <sec>]",
-    "  edit    | apply_edits   [--best-effort] [--dry-run] [--verify <cmd>] (JSON via --json or stdin)",
+    "  edit    | apply_edits   [--best-effort] [--dry-run] [--diff] [--verify <cmd>] (JSON via --json or stdin)",
     "",
     "JSON input (works for every command using the exact MCP tool schema):",
     "  --json '<json>'         Pass tool arguments JSON object (or shorthand array) inline",
@@ -306,6 +306,7 @@ interface ParsedCliOptions {
   // edit flags
   bestEffort?: boolean;
   dryRun?: boolean;
+  diff?: boolean;
   verify?: string;
   verifyTimeoutSec?: number;
   maxVerifyChars?: number;
@@ -515,6 +516,10 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
         opts.dryRun = true;
         continue;
       }
+      if (arg === "--diff") {
+        opts.diff = true;
+        continue;
+      }
       if (arg === "--verify") {
         opts.verify = consumeValue();
         continue;
@@ -699,6 +704,7 @@ export async function runAgyFastCli(
       cwd: effectiveCwd,
       ...(opts.bestEffort !== undefined ? { bestEffort: opts.bestEffort } : {}),
       ...(opts.dryRun !== undefined ? { dryRun: opts.dryRun } : {}),
+      ...(opts.diff !== undefined ? { diff: opts.diff } : {}),
       ...(opts.verify !== undefined ? { verify: opts.verify } : {}),
       ...(opts.verifyTimeoutSec !== undefined
         ? { verifyTimeoutSec: opts.verifyTimeoutSec }
