@@ -10425,7 +10425,7 @@ function readSavedEditsFormatSync(env = process.env) {
 }
 
 // src/mcp-server-core.ts
-var SERVER_VERSION = "0.3.1";
+var SERVER_VERSION = "0.3.2";
 var DEFAULT_PLUGIN_ROOT = path7.resolve(
   path7.dirname(fileURLToPath2(import.meta.url)),
   ".."
