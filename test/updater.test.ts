@@ -19,6 +19,7 @@ import {
   runPluginUpdate,
   shouldTriggerBackgroundCheck,
   skipUpdateVersion,
+  UPDATER_OPTIONAL_FILES,
   UPDATER_RUNTIME_FILES,
   validateRepoUrl,
   verifyStagedPlugin,
@@ -28,6 +29,12 @@ import {
 const REPO_ROOT = process.cwd();
 const INSTALL_SCRIPT = path.join(REPO_ROOT, "scripts", "install.mjs");
 const UPDATER_DIST = path.join(REPO_ROOT, "dist", "updater.mjs");
+
+describe("updater optional files", () => {
+  it("includes README.zh-TW.md in the optional updater file set", () => {
+    assert.ok(UPDATER_OPTIONAL_FILES.includes("README.zh-TW.md"));
+  });
+});
 
 function makeNoGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const cleaned: NodeJS.ProcessEnv = {};

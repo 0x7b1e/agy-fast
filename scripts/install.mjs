@@ -41,6 +41,7 @@ const OPTIONAL_DOC_FILES = [
   "assets/architecture-zh-dark.svg",
   "README.md",
   "README.zh-CN.md",
+  "README.zh-TW.md",
   "CHANGELOG.md",
   "docs/ANALYSIS_REPORT.md",
   "docs/ANALYSIS_REPORT.zh-CN.md",
