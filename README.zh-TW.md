@@ -159,7 +159,7 @@ node scripts/install.mjs install --project /path/to/your-repo
 | **原生外掛清單** | [`plugin.json`](plugin.json) | 符合官方規範的中繼資料，通過 `agy plugin validate --strict` 零警告驗證 |
 | **本機常駐 MCP 服務** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | 在本機常駐執行，在 `agy-fast_fast` 下以急載入（`"eager": true`）暴露 5 個強型別合併工具 |
 | **工作階段啟動快照鉤子** | [`hooks.json`](hooks.json) → [`dist/session-start.mjs`](dist/session-start.mjs) | 僅在 `SessionStart` 執行一次（`~35–50 ms`，內建 `250 ms` 掃描熔斷與系統/使用者目錄黑名單），注入 `≤1.5 KB` 專案/Git/目錄快照 |
-| **工具路由與衛生規則** | [`rules/AGENTS.md`](rules/AGENTS.md) | 約 `6.5 KB` 精簡路由規則，內聯參數簽名（支援自訂 `rules/AGENTS.local.md`，需帶 `trigger: always_on` frontmatter，更新與重新安裝自動保留） |
+| **工具路由與衛生規則** | [`rules/AGENTS.md`](rules/AGENTS.md) | 約 `8.5 KB` 精簡路由規則，內聯參數簽名（支援自訂 `rules/AGENTS.local.md`，需帶 `trigger: always_on` frontmatter，更新與重新安裝自動保留） |
 | **背景自動更新器** | [`dist/updater.mjs`](dist/updater.mjs) | 4 小時分離式背景檢查，先暫存執行 MCP 冒煙驗證再原子替換 |
 | **離線基準測試工具** | [`dist/benchmark.mjs`](dist/benchmark.mjs) | 本機解析 `transcript.jsonl` 並輸出單次指標或前後 A/B 比較 |
 
@@ -275,14 +275,15 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | **健康檢查** *（Node 版本、`rg`、MCP 即時握手、`SessionStart` 延遲、嚴格清單驗證）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs doctor` |
 | **僅檢查更新** *（不修改檔案）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update --check` |
 | **立即更新並自檢** *（先暫存冒煙驗證再替換）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update` |
+| **互動式更新 / 略過指定版本** *（`[y]es/[n]o/[s]kip`，傳 `none` 清除）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update --prompt` *（或 `update --skip-version <ver\|none>`）* |
 | **配置自動更新策略** *（`auto` \| `notify` \| `off`）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --auto-update notify --interval 24` |
-| **切換 MCP 工具載入模式** *（`eager` \| `lazy`，自動更新保留）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --tool-loading lazy` |
+| **切換 MCP 載入模式 / 編輯參數格式** *（`--tool-loading eager\|lazy`、`--edits-format auto\|array\|string`，自動更新保留）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --tool-loading lazy` *（或 `config --edits-format array`）* |
 | **CLI 直調模式** *（供 Swarm Worker 及無 MCP 環境通過 `run_command` 呼叫）* | `node ~/.gemini/config/plugins/agy-fast/dist/mcp-server.mjs --cli <search\|outline\|slice\|edit\|check>` |
 | **獨立 MCP Stdio 服務** *（供標準 MCP 用戶端掛載；透傳 `--tools`、`--schema-compat=minimal`、`--cli`）* | `npx -y agy-fast mcp` *（或 `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs mcp`）* |
 | **產生 MCP 設定 / 通用規則** *（`--host mcp-only\|json\|generic\|antigravity`、`--tools`、`--rules`）* | `npx -y agy-fast mcp-config --rules` *（或 `node .../scripts/install.mjs mcp-config`）* |
 | **一鍵乾淨解除安裝** | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs uninstall` |
 
-> 在本機複製目錄中，也可直接使用 `./install.sh <子指令>`（macOS/Linux）或 `.\install.ps1 <子指令>`（Windows）執行上述全部子指令。
+> 在本機複製目錄中，也可直接使用 `./install.sh <子指令>`（macOS/Linux）或 `.\install.ps1 <子指令>`（Windows）執行相同的外掛管理子指令（`doctor`、`update`、`config`、`uninstall`）。
 
 ### 零啟動延遲的背景自動更新
 
@@ -296,9 +297,11 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | 環境變數 | 可選值 / 預設值 | 說明 |
 | :--- | :--- | :--- |
 | `AGY_FAST_AUTO_UPDATE` | `auto` *（預設）* \| `notify` \| `off` | 覆蓋已儲存的自動更新模式 |
-| `AGY_FAST_UPDATE_INTERVAL_HOURS` | `12` *（預設；`1..720`）* | 背景檢查間隔（小時） |
+| `AGY_FAST_UPDATE_INTERVAL_HOURS` | `4` *（預設；`0.01..720`；CLI `--interval` 為 `1..720`）* | 背景檢查間隔（小時） |
 | `AGY_FAST_UPDATE_CHANNEL` | `release` *（預設）* \| `main` | 跟蹤穩定發版標籤或 `main` 分支 |
 | `AGY_FAST_REPO` | Git 儲存庫網址 | 自訂鏡像或 Fork 儲存庫網址 |
+| `AGY_FAST_TOOL_LOADING` | `eager` *（預設）* \| `lazy` | 覆蓋安裝/更新時寫入 `mcp_config.json` 的 MCP 工具載入模式（亦支援 `config --tool-loading`） |
+| `AGY_FAST_CACHE_DIR` | 目錄路徑 *（預設 `~/.gemini/cache/agy-fast`）* | 覆蓋本機快取目錄（存放 `config.json`、更新狀態與鎖檔） |
 | `AGY_FAST_EDITS_FORMAT` | `auto` *（預設）* \| `array` \| `string` | 控制 `apply_edits.edits` 參數格式策略（`auto` 在支援 `"eager": true` 的 CLI ≥1.5.8、桌面版 2.0、IDE 與第三方用戶端統一走省 token 的強型別原生陣列，在舊版懶載入 CLI 1.5.0–1.5.7 自動切換為 JSON 陣列字串以防 `[]` 丟參；伺服器端一律相容兩種格式） |
 | `AGY_FAST_HOST` | 如 `cli@1.5.14`、`ide@2.7.0`、`desktop@2.34.0` | 手動覆蓋自動探測到的 Antigravity 宿主端型別與版本 |
 | `AGY_FAST_TOOLS` | 逗號分隔工具名 *（預設全部 5 個）* | 僅暴露指定的 MCP 工具子集（亦支援 `--tools <列表>`） |
@@ -344,7 +347,7 @@ npm install
 npm run typecheck   # TypeScript 嚴格型別檢查
 npm run build       # 使用 esbuild 打包 src/*.ts -> dist/*.mjs
 npm test            # 執行單元測試、MCP 協議測試、Hook 測試、基準測試與安裝器測試
-npm run bench:stress # 執行 12 場景端到端壓測與效能基準套件
+npm run bench:stress # 執行 11 場景端對端壓測與效能基準套件（傳入 --real-repo=<path> 可啟用第 12 實倉場景）
 npm run validate    # 執行 `agy plugin validate --strict .`
 ```
 
