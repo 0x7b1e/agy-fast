@@ -520,6 +520,57 @@ function hasPowerShellSemicolonChaining(command, withoutSingle, unquoted) {
   }
   return hasSemicolonChain;
 }
+function extractExplicitWindowsPowerShellInvocation(command) {
+  const trimmed = command.trim();
+  if (!trimmed || /[\r\n\x00]/.test(trimmed)) return null;
+  const binMatch = WINDOWS_PS_WRAPPER_BIN_RE.exec(trimmed);
+  if (!binMatch) return null;
+  const rawBinToken = binMatch[0].replace(/^["']|["']$/g, "").toLowerCase();
+  const requestedBin = rawBinToken.startsWith("pwsh") ? "pwsh" : "powershell.exe";
+  let rest = trimmed.slice(binMatch[0].length);
+  let sawCommandFlag = false;
+  while (true) {
+    rest = rest.trimStart();
+    if (!rest) return null;
+    const tokMatch = /^(\S+)/.exec(rest);
+    if (!tokMatch) return null;
+    const tok = tokMatch[1];
+    const lower = tok.toLowerCase();
+    rest = rest.slice(tok.length);
+    if (lower === "-command" || lower === "-c") {
+      if (!/^\s/.test(rest)) return null;
+      sawCommandFlag = true;
+      break;
+    }
+    if (!WINDOWS_PS_BENIGN_FLAGS.has(lower)) {
+      return null;
+    }
+  }
+  if (!sawCommandFlag) return null;
+  const payload = rest.trim();
+  if (!payload || WINDOWS_CMD_ENV_VAR_RE.test(payload)) {
+    return null;
+  }
+  let script;
+  if (payload[0] === '"' || payload[0] === "'") {
+    const quote = payload[0];
+    if (payload.length < 2 || payload.indexOf(quote, 1) !== payload.length - 1) {
+      return null;
+    }
+    const rawInner = payload.slice(1, -1);
+    if (quote === '"' && rawInner.endsWith("\\")) {
+      return null;
+    }
+    script = rawInner.trim();
+  } else {
+    if (payload.startsWith("-") || /[&|<>^"`']/.test(payload)) {
+      return null;
+    }
+    script = payload;
+  }
+  if (!script) return null;
+  return { requestedBin, script };
+}
 function stripQuotedSpans(command, stripDoubleQuotes) {
   let out = "";
   let quote = null;
@@ -617,8 +668,10 @@ function buildPowerShellUtf8Command(command) {
 }
 var cachedWindowsPowerShell;
 var cachedWindowsPowerShellExecPath = null;
+var cachedLegacyPowerShellExecPath;
 var pendingWindowsPowerShellProbe = null;
-async function defaultProbeWindowsShell(bin) {
+var pendingLegacyPowerShellProbe = null;
+async function probeShellExecPath(bin) {
   const { bin: whereBin, cwd } = getWindowsSystem32Binary("where.exe");
   const exeQuery = bin.toLowerCase().endsWith(".exe") ? bin : `${bin}.exe`;
   const whereRes = await execBinaryAsync(whereBin, [exeQuery], {
@@ -627,11 +680,9 @@ async function defaultProbeWindowsShell(bin) {
     maxOutputBytes: 4096
   });
   if (!whereRes.error && !whereRes.timedOut) {
-    if (whereRes.exitCode !== 0) return false;
+    if (whereRes.exitCode !== 0) return null;
     const resolved = whereRes.stdout.split(/\r?\n/).map((line) => line.trim()).find((line) => /\.exe$/i.test(line));
-    if (!resolved) return false;
-    cachedWindowsPowerShellExecPath = resolved;
-    return true;
+    return resolved ?? null;
   }
   const res = await execBinaryAsync(
     exeQuery,
@@ -643,10 +694,45 @@ async function defaultProbeWindowsShell(bin) {
     }
   );
   if (!res.error && !res.timedOut && res.exitCode === 0) {
-    cachedWindowsPowerShellExecPath = exeQuery;
+    return exeQuery;
+  }
+  return null;
+}
+async function defaultProbeWindowsShell(bin) {
+  const resolved = await probeShellExecPath(bin);
+  if (bin === "powershell.exe") {
+    cachedLegacyPowerShellExecPath = resolved;
+  }
+  if (resolved) {
+    cachedWindowsPowerShellExecPath = resolved;
     return true;
   }
   return false;
+}
+async function resolveExplicitWindowsPowerShellExecPath(requestedBin, probeExecPath = probeShellExecPath) {
+  const preferred = await resolveWindowsPowerShell();
+  if (requestedBin === "pwsh") {
+    return preferred === "pwsh" ? cachedWindowsPowerShellExecPath ?? "pwsh" : null;
+  }
+  if (preferred === "powershell.exe" && cachedWindowsPowerShellExecPath) {
+    return cachedWindowsPowerShellExecPath;
+  }
+  if (cachedLegacyPowerShellExecPath !== void 0) {
+    return cachedLegacyPowerShellExecPath;
+  }
+  if (pendingLegacyPowerShellProbe) {
+    return pendingLegacyPowerShellProbe;
+  }
+  pendingLegacyPowerShellProbe = (async () => {
+    try {
+      const resolved = await probeExecPath("powershell.exe");
+      cachedLegacyPowerShellExecPath = resolved;
+      return resolved;
+    } finally {
+      pendingLegacyPowerShellProbe = null;
+    }
+  })();
+  return pendingLegacyPowerShellProbe;
 }
 async function resolveWindowsPowerShell(probe = defaultProbeWindowsShell) {
   if (cachedWindowsPowerShell !== void 0) {
@@ -704,6 +790,21 @@ async function runShellCommandAsync(command, options) {
   };
   if (process.platform === "win32") {
     const effectiveCommand = unwrapTrivialWindowsPowerShellCommand(command);
+    const explicitPs = extractExplicitWindowsPowerShellInvocation(effectiveCommand);
+    if (explicitPs) {
+      const explicitExecPath = await resolveExplicitWindowsPowerShellExecPath(
+        explicitPs.requestedBin
+      );
+      if (explicitExecPath) {
+        const utf8Command = buildPowerShellUtf8Command(explicitPs.script);
+        return spawnAndCollect(
+          explicitExecPath,
+          ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
+          false,
+          effectiveOptions
+        );
+      }
+    }
     if (needsPowerShellOnWindows(effectiveCommand)) {
       const psBin = await resolveWindowsPowerShell();
       if (psBin) {
@@ -9493,9 +9594,9 @@ function shouldCliExitNonZero(tool, result) {
 }
 
 // src/mcp-server-core.ts
-import fs6 from "node:fs";
+import fs7 from "node:fs";
 import os4 from "node:os";
-import path7 from "node:path";
+import path8 from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/protocol/mcp.ts
@@ -10424,10 +10525,107 @@ function readSavedEditsFormatSync(env = process.env) {
   }
 }
 
+// src/utils/session-workspace.ts
+import fs6 from "node:fs";
+import path7 from "node:path";
+
+// src/utils/snapshot.ts
+var SNAPSHOT_COLLAPSE_DIRS = /* @__PURE__ */ new Set([
+  "tmp",
+  "temp",
+  "output",
+  "outputs",
+  "artifacts",
+  "ssl",
+  "SSL",
+  "playwright-report",
+  "test-results",
+  "coverage",
+  "logs"
+]);
+var DEFAULT_IGNORE_DIRS_LOWER = new Set(
+  [...DEFAULT_IGNORE_DIRS].map((d) => d.toLowerCase())
+);
+var SNAPSHOT_COLLAPSE_DIRS_LOWER = new Set(
+  [...SNAPSHOT_COLLAPSE_DIRS].map((d) => d.toLowerCase())
+);
+var TIMEOUT_SENTINEL = Symbol("snapshot-timeout");
+var MANIFEST_SKIP_SUBDIRS_LOWER = new Set(
+  [
+    "docs",
+    "doc",
+    "assets",
+    "scripts",
+    "test",
+    "tests",
+    "fixtures",
+    "examples",
+    ...SNAPSHOT_COLLAPSE_DIRS
+  ].map((d) => d.toLowerCase())
+);
+
+// src/utils/session-workspace.ts
+function isFullAbsolutePath(dirPath) {
+  return process.platform === "win32" ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(dirPath) : path7.isAbsolute(dirPath);
+}
+function canonicalizeDirSync(dirPath) {
+  const resolved = path7.resolve(dirPath);
+  try {
+    return typeof fs6.realpathSync.native === "function" ? fs6.realpathSync.native(resolved) : fs6.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+function isSameOrSubdir(candidate, root) {
+  const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
+  const normCandidate = caseInsensitive ? candidate.toLowerCase() : candidate;
+  const normRoot = caseInsensitive ? root.toLowerCase() : root;
+  const rel = path7.relative(normRoot, normCandidate);
+  return rel === "" || rel !== ".." && !rel.startsWith(`..${path7.sep}`) && !path7.isAbsolute(rel);
+}
+function isInstalledPluginPath(dirPath) {
+  const posix = dirPath.replace(/\\/g, "/");
+  return /(?:^|\/)(?:\.gemini\/(?:config\/|antigravity[^/]*\/)?plugins|\.agents\/plugins)\/[^/]+(?:\/|$)/i.test(
+    posix
+  );
+}
+function detectPluginInstallDir(candidateDir, scriptPluginRoot, env = process.env, options = {}) {
+  const allowLinkedDevCheckout = options.allowLinkedDevCheckout === true;
+  const resolvedCandidate = path7.resolve(candidateDir);
+  const canonCandidate = canonicalizeDirSync(resolvedCandidate);
+  for (const envRoot of [env.PLUGIN_ROOT, env.AGY_PLUGIN_ROOT]) {
+    if (typeof envRoot === "string" && envRoot.trim()) {
+      const trimmedEnvRoot = envRoot.trim();
+      const resolvedEnvRoot = path7.resolve(trimmedEnvRoot);
+      const canonEnvRoot = canonicalizeDirSync(resolvedEnvRoot);
+      if (isSameOrSubdir(canonCandidate, canonEnvRoot)) {
+        if (!allowLinkedDevCheckout) {
+          return trimmedEnvRoot;
+        }
+        const isDevCheckout = fs6.existsSync(
+          path7.join(canonEnvRoot, "src", "mcp-server.ts")
+        );
+        if (!isDevCheckout || isSameOrSubdir(resolvedCandidate, resolvedEnvRoot) || isInstalledPluginPath(resolvedCandidate)) {
+          return trimmedEnvRoot;
+        }
+      }
+    }
+  }
+  const resolvedScriptRoot = path7.resolve(scriptPluginRoot);
+  const canonScriptRoot = canonicalizeDirSync(resolvedScriptRoot);
+  if (isSameOrSubdir(canonCandidate, canonScriptRoot)) {
+    const isRuntimeOnlyInstall = fs6.existsSync(path7.join(canonScriptRoot, "plugin.json")) && !fs6.existsSync(path7.join(canonScriptRoot, "src", "mcp-server.ts"));
+    if (isInstalledPluginPath(resolvedCandidate) || isInstalledPluginPath(canonScriptRoot) || isRuntimeOnlyInstall) {
+      return scriptPluginRoot;
+    }
+  }
+  return null;
+}
+
 // src/mcp-server-core.ts
 var SERVER_VERSION = "0.3.2";
-var DEFAULT_PLUGIN_ROOT = path7.resolve(
-  path7.dirname(fileURLToPath2(import.meta.url)),
+var DEFAULT_PLUGIN_ROOT = path8.resolve(
+  path8.dirname(fileURLToPath2(import.meta.url)),
   ".."
 );
 var ALL_MCP_TOOLS = [
@@ -10621,71 +10819,33 @@ function printMcpServerHelp() {
     ].join("\n")
   );
 }
-function canonicalizeDir(dirPath) {
-  const resolved = path7.resolve(dirPath);
-  try {
-    return typeof fs6.realpathSync.native === "function" ? fs6.realpathSync.native(resolved) : fs6.realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
-}
-function isSameOrSubdir(candidate, root) {
-  const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
-  const normCandidate = caseInsensitive ? candidate.toLowerCase() : candidate;
-  const normRoot = caseInsensitive ? root.toLowerCase() : root;
-  const rel = path7.relative(normRoot, normCandidate);
-  return rel === "" || rel !== ".." && !rel.startsWith(`..${path7.sep}`) && !path7.isAbsolute(rel);
-}
-function isInstalledPluginPath(dirPath) {
-  const posix = dirPath.replace(/\\/g, "/");
-  return /(?:^|\/)(?:\.gemini\/(?:config\/|antigravity[^/]*\/)?plugins|\.agents\/plugins)\/[^/]+(?:\/|$)/i.test(
-    posix
-  );
-}
 function isSameDir(a, b) {
   const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
   return caseInsensitive ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 function detectNonWorkspaceCwd(env, currentCwd) {
-  const canonCwd = canonicalizeDir(currentCwd);
-  if (path7.parse(canonCwd).root === canonCwd) {
+  const canonCwd = canonicalizeDirSync(currentCwd);
+  if (path8.parse(canonCwd).root === canonCwd) {
     return { dir: canonCwd, place: "the filesystem root" };
   }
-  const isFullAbsPath = (p) => process.platform === "win32" ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(p) : path7.isAbsolute(p);
   const driveHome = process.platform === "win32" && typeof env.HOMEDRIVE === "string" && typeof env.HOMEPATH === "string" && env.HOMEDRIVE.trim() && env.HOMEPATH.trim() ? `${env.HOMEDRIVE.trim()}${env.HOMEPATH.trim()}` : "";
-  const homes = [env.HOME, env.USERPROFILE, driveHome].map((h) => typeof h === "string" ? h.trim() : "").filter((h) => h && isFullAbsPath(h));
+  const homes = [env.HOME, env.USERPROFILE, driveHome].map((h) => typeof h === "string" ? h.trim() : "").filter((h) => h && isFullAbsolutePath(h));
   if (homes.length === 0 && env === process.env) {
     try {
       const osHome = os4.homedir();
-      if (isFullAbsPath(osHome)) homes.push(osHome);
+      if (isFullAbsolutePath(osHome)) homes.push(osHome);
     } catch {
     }
   }
   for (const home of homes) {
-    if (home && isSameDir(canonCwd, canonicalizeDir(home))) {
+    if (home && isSameDir(canonCwd, canonicalizeDirSync(home))) {
       return { dir: canonCwd, place: "the home directory" };
     }
   }
   return null;
 }
 function detectPluginInstallCwd(env, currentCwd, scriptPluginRoot) {
-  const canonCwd = canonicalizeDir(currentCwd);
-  for (const envRoot of [env.PLUGIN_ROOT, env.AGY_PLUGIN_ROOT]) {
-    if (typeof envRoot === "string" && envRoot.trim()) {
-      const canonEnvRoot = canonicalizeDir(envRoot.trim());
-      if (isSameOrSubdir(canonCwd, canonEnvRoot)) {
-        return envRoot.trim();
-      }
-    }
-  }
-  const canonScriptRoot = canonicalizeDir(scriptPluginRoot);
-  if (isSameOrSubdir(canonCwd, canonScriptRoot)) {
-    const isRuntimeOnlyInstall = fs6.existsSync(path7.join(canonScriptRoot, "plugin.json")) && !fs6.existsSync(path7.join(canonScriptRoot, "src", "mcp-server.ts"));
-    if (isInstalledPluginPath(canonScriptRoot) || isRuntimeOnlyInstall) {
-      return scriptPluginRoot;
-    }
-  }
-  return null;
+  return detectPluginInstallDir(currentCwd, scriptPluginRoot, env);
 }
 function buildApplyEditsToolDefinition(compat) {
   const preferStringEdits = compat.editsFormat === "string";
@@ -10800,11 +10960,11 @@ function createAgyFastServer(options = {}) {
         value: { ...args, cwd: void 0 }
       };
     }
-    if (!path7.isAbsolute(rawCwd) && !isHomePath) {
+    if (!path8.isAbsolute(rawCwd) && !isHomePath) {
       if (defaultCwd) {
         return {
           ok: true,
-          value: { ...args, cwd: path7.resolve(defaultCwd, rawCwd) }
+          value: { ...args, cwd: path8.resolve(defaultCwd, rawCwd) }
         };
       }
       const pluginFallbackDir = detectPluginInstallCwd(
@@ -10846,12 +11006,12 @@ function createAgyFastServer(options = {}) {
       if (typeof rawCwd !== "string" || !rawCwd.trim()) return true;
       const trimmed = rawCwd.trim();
       const isHome = trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\");
-      return !path7.isAbsolute(trimmed) && !isHome;
+      return !path8.isAbsolute(trimmed) && !isHome;
     },
     onWorkspaceRoots: (paths) => {
       for (const candidate of paths) {
         try {
-          if (fs6.statSync(candidate).isDirectory()) {
+          if (fs7.statSync(candidate).isDirectory()) {
             defaultCwd = candidate;
             return;
           }
