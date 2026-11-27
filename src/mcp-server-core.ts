@@ -383,7 +383,7 @@ function buildApplyEditsToolDefinition(
         },
       };
 
-  const baseDesc = `Atomic multi-file edits. bestEffort writes valid files atomically per file, gives closest lines, skips verify on failure. dryRun=false (true validates only). verify shell in cwd after writes (60s/4000 chars default, agy drops at 180s). 8800 UTF-8 bytes total. Absolute cwd if no roots/list (Desktop 2.0 Hub).`;
+  const baseDesc = `Atomic multi-file edits. bestEffort writes valid files per file, gives closest lines, skips verify on failure. dryRun validates only. verify cmd in cwd after writes (60s/4000 chars, ${MCP_CALL_BUDGET_SEC}s max). diff adds +-2-line diff. 8800B UTF-8 max. Absolute cwd if no roots/list (Desktop 2.0 Hub).`;
 
   return {
     name: "apply_edits",
@@ -397,6 +397,7 @@ function buildApplyEditsToolDefinition(
         edits: editsSchema,
         dryRun: { type: "boolean" },
         bestEffort: { type: "boolean" },
+        diff: { type: "boolean" },
         verify: { type: "string" },
         verifyTimeoutSec: {
           type: "integer",

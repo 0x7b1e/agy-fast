@@ -385,6 +385,11 @@ describe("MCP Stdio Server end-to-end", () => {
         );
       }
       const applyTool = tools.find((t) => t.name === "apply_edits")!;
+      assert.deepEqual(
+        (applyTool.inputSchema as { properties?: Record<string, unknown> }).properties?.diff,
+        { type: "boolean" },
+        `apply_edits (${mode} mode) must expose optional boolean 'diff' within <= 1280B budget`,
+      );
       if (mode === "array") {
         assert.doesNotMatch(
           applyTool.description,
